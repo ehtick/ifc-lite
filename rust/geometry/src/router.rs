@@ -6,12 +6,14 @@
 //!
 //! Routes IFC representation entities to appropriate processors based on type.
 
-use crate::{Mesh, Point3, Vector3, Result, Error};
-use crate::processors::{ExtrudedAreaSolidProcessor, TriangulatedFaceSetProcessor, MappedItemProcessor, FacetedBrepProcessor, BooleanClippingProcessor, SweptDiskSolidProcessor, RevolvedAreaSolidProcessor, AdvancedBrepProcessor};
-use ifc_lite_core::{
-    DecodedEntity, EntityDecoder, GeometryCategory, IfcSchema, IfcType, ProfileCategory,
+use crate::processors::{
+    AdvancedBrepProcessor, BooleanClippingProcessor, ExtrudedAreaSolidProcessor,
+    FacetedBrepProcessor, MappedItemProcessor, RevolvedAreaSolidProcessor, SweptDiskSolidProcessor,
+    TriangulatedFaceSetProcessor,
 };
-use nalgebra::{Matrix4, Rotation3};
+use crate::{Error, Mesh, Point3, Result, Vector3};
+use ifc_lite_core::{DecodedEntity, EntityDecoder, GeometryCategory, IfcSchema, IfcType};
+use nalgebra::Matrix4;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -48,6 +50,9 @@ pub struct GeometryRouter {
     /// Buildings with repeated floors have 99% identical geometry
     /// Key: Hash of mesh content, Value: Processed mesh
     geometry_hash_cache: RefCell<FxHashMap<u64, Arc<Mesh>>>,
+    /// Unit scale factor (e.g., 0.001 for millimeters -> meters)
+    /// Applied to all mesh positions after processing
+    unit_scale: f64,
 }
 
 impl GeometryRouter {
@@ -61,19 +66,75 @@ impl GeometryRouter {
             mapped_item_cache: RefCell::new(FxHashMap::default()),
             faceted_brep_cache: RefCell::new(FxHashMap::default()),
             geometry_hash_cache: RefCell::new(FxHashMap::default()),
+            unit_scale: 1.0, // Default to base meters
         };
 
         // Register default P0 processors
-        router.register(Box::new(ExtrudedAreaSolidProcessor::new(schema_clone.clone())));
+        router.register(Box::new(ExtrudedAreaSolidProcessor::new(
+            schema_clone.clone(),
+        )));
         router.register(Box::new(TriangulatedFaceSetProcessor::new()));
         router.register(Box::new(MappedItemProcessor::new()));
         router.register(Box::new(FacetedBrepProcessor::new()));
         router.register(Box::new(BooleanClippingProcessor::new()));
         router.register(Box::new(SweptDiskSolidProcessor::new(schema_clone.clone())));
-        router.register(Box::new(RevolvedAreaSolidProcessor::new(schema_clone.clone())));
+        router.register(Box::new(RevolvedAreaSolidProcessor::new(
+            schema_clone.clone(),
+        )));
         router.register(Box::new(AdvancedBrepProcessor::new()));
 
         router
+    }
+
+    /// Create router and extract unit scale from IFC file
+    /// Automatically finds IFCPROJECT and extracts length unit conversion
+    pub fn with_units(content: &str, decoder: &mut EntityDecoder) -> Self {
+        let mut router = Self::new();
+
+        // Use EntityScanner to efficiently find IFCPROJECT
+        use ifc_lite_core::EntityScanner;
+        let mut scanner = EntityScanner::new(content);
+
+        // Scan through file to find IFCPROJECT
+        while let Some((id, type_name, _, _)) = scanner.next_entity() {
+            if type_name == "IFCPROJECT" {
+                // Extract unit scale from IFCPROJECT
+                if let Ok(scale) = ifc_lite_core::extract_length_unit_scale(decoder, id) {
+                    router.unit_scale = scale;
+                }
+                break;
+            }
+        }
+
+        router
+    }
+
+    /// Get the current unit scale factor
+    pub fn unit_scale(&self) -> f64 {
+        self.unit_scale
+    }
+
+    /// Scale mesh positions from file units to meters
+    /// Only applies scaling if unit_scale != 1.0
+    #[inline]
+    fn scale_mesh(&self, mesh: &mut Mesh) {
+        if self.unit_scale != 1.0 {
+            let scale = self.unit_scale as f32;
+            for pos in mesh.positions.iter_mut() {
+                *pos *= scale;
+            }
+        }
+    }
+
+    /// Scale the translation component of a transform matrix from file units to meters
+    /// The rotation/scale part stays unchanged, only translation (column 3) is scaled
+    #[inline]
+    fn scale_transform(&self, transform: &mut Matrix4<f64>) {
+        if self.unit_scale != 1.0 {
+            transform[(0, 3)] *= self.unit_scale;
+            transform[(1, 3)] *= self.unit_scale;
+            transform[(2, 3)] *= self.unit_scale;
+        }
     }
 
     /// Register a geometry processor
@@ -138,8 +199,8 @@ impl GeometryRouter {
     }
 
     /// Try to get cached mesh by hash, or cache the provided mesh
-    /// Returns Arc<Mesh> - either from cache or newly cached
-    /// 
+    /// Returns `Arc<Mesh>` - either from cache or newly cached
+    ///
     /// Note: Uses hash-only lookup without full equality check for performance.
     /// FxHasher's 64-bit output makes collisions extremely rare (~1 in 2^64).
     #[inline]
@@ -217,7 +278,15 @@ impl GeometryRouter {
                 if let Some(rep_type) = rep_type_attr.as_string() {
                     matches!(
                         rep_type,
-                        "Body" | "SweptSolid" | "Brep" | "CSG" | "Clipping" | "SurfaceModel" | "Tessellation" | "AdvancedSweptSolid" | "AdvancedBrep"
+                        "Body"
+                            | "SweptSolid"
+                            | "Brep"
+                            | "CSG"
+                            | "Clipping"
+                            | "SurfaceModel"
+                            | "Tessellation"
+                            | "AdvancedSweptSolid"
+                            | "AdvancedBrep"
                     )
                 } else {
                     false
@@ -245,7 +314,16 @@ impl GeometryRouter {
                     // Only process solid geometry representations
                     if !matches!(
                         rep_type,
-                        "Body" | "SweptSolid" | "Brep" | "CSG" | "Clipping" | "SurfaceModel" | "Tessellation" | "MappedRepresentation" | "AdvancedSweptSolid" | "AdvancedBrep"
+                        "Body"
+                            | "SweptSolid"
+                            | "Brep"
+                            | "CSG"
+                            | "Clipping"
+                            | "SurfaceModel"
+                            | "Tessellation"
+                            | "MappedRepresentation"
+                            | "AdvancedSweptSolid"
+                            | "AdvancedBrep"
                     ) {
                         continue; // Skip non-solid representations like 'Axis', 'Curve2D', etc.
                     }
@@ -270,6 +348,150 @@ impl GeometryRouter {
         self.apply_placement(element, decoder, &mut combined_mesh)?;
 
         Ok(combined_mesh)
+    }
+
+    /// Process element with void subtraction (openings)
+    /// Uses fast box subtraction with bitflag classification for O(n) performance
+    #[inline]
+    pub fn process_element_with_voids(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        void_index: &rustc_hash::FxHashMap<u32, Vec<u32>>,
+    ) -> Result<Mesh> {
+        // Get base geometry
+        let mut mesh = self.process_element(element, decoder)?;
+
+        if mesh.is_empty() {
+            return Ok(mesh);
+        }
+
+        // Check if this element has any openings
+        let opening_ids = match void_index.get(&element.id) {
+            Some(ids) => ids,
+            None => return Ok(mesh), // No openings, return base mesh
+        };
+
+        if opening_ids.is_empty() {
+            return Ok(mesh);
+        }
+
+        // Get opening geometries and subtract using CSG
+        use crate::csg::ClippingProcessor;
+        let clipper = ClippingProcessor::new();
+
+        // Get host bounding box for edge detection
+        let (host_min, host_max) = mesh.bounds();
+
+        // Find host's "thickness" direction (smallest dimension)
+        let host_size_x = host_max.x - host_min.x;
+        let host_size_y = host_max.y - host_min.y;
+        let host_size_z = host_max.z - host_min.z;
+
+        let thickness_axis = if host_size_x <= host_size_y && host_size_x <= host_size_z {
+            0 // X is thickness (wall in YZ plane)
+        } else if host_size_y <= host_size_x && host_size_y <= host_size_z {
+            1 // Y is thickness (wall in XZ plane)
+        } else {
+            2 // Z is thickness (slab in XY plane)
+        };
+
+        let padding = 0.01; // 1cm tolerance
+
+        // STEP 1: Collect all valid openings into a combined mesh
+        // This avoids CSG issues with adjacent openings creating new edges
+        let mut combined_openings = Mesh::new();
+
+        for &opening_id in opening_ids {
+            let opening_entity = match decoder.decode_by_id(opening_id) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let opening_mesh = match self.process_element(&opening_entity, decoder) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if opening_mesh.is_empty() {
+                continue;
+            }
+
+            // Extend opening slightly in thickness direction to avoid coplanar faces
+            // This ensures CSG works reliably even when opening bounds match host bounds
+            let extend = 0.01; // 1cm extension on each side
+
+            let mut extended_mesh = opening_mesh;
+            let (open_min, open_max) = extended_mesh.bounds();
+
+            // Check if opening needs extension in thickness direction
+            let needs_extension = match thickness_axis {
+                0 => {
+                    (open_min.x - host_min.x).abs() < padding
+                        || (open_max.x - host_max.x).abs() < padding
+                }
+                1 => {
+                    (open_min.y - host_min.y).abs() < padding
+                        || (open_max.y - host_max.y).abs() < padding
+                }
+                _ => {
+                    (open_min.z - host_min.z).abs() < padding
+                        || (open_max.z - host_max.z).abs() < padding
+                }
+            };
+
+            if needs_extension {
+                // Scale mesh slightly in thickness direction from its center
+                let center = [
+                    (open_min.x + open_max.x) / 2.0,
+                    (open_min.y + open_max.y) / 2.0,
+                    (open_min.z + open_max.z) / 2.0,
+                ];
+                let size = [
+                    open_max.x - open_min.x,
+                    open_max.y - open_min.y,
+                    open_max.z - open_min.z,
+                ];
+
+                // Calculate scale factor to add 'extend' on each side
+                let scale = match thickness_axis {
+                    0 => [(size[0] + 2.0 * extend) / size[0].max(0.001), 1.0, 1.0],
+                    1 => [1.0, (size[1] + 2.0 * extend) / size[1].max(0.001), 1.0],
+                    _ => [1.0, 1.0, (size[2] + 2.0 * extend) / size[2].max(0.001)],
+                };
+
+                // Apply scaling from center
+                for i in 0..(extended_mesh.positions.len() / 3) {
+                    let px = extended_mesh.positions[i * 3];
+                    let py = extended_mesh.positions[i * 3 + 1];
+                    let pz = extended_mesh.positions[i * 3 + 2];
+
+                    extended_mesh.positions[i * 3] = center[0] + (px - center[0]) * scale[0];
+                    extended_mesh.positions[i * 3 + 1] = center[1] + (py - center[1]) * scale[1];
+                    extended_mesh.positions[i * 3 + 2] = center[2] + (pz - center[2]) * scale[2];
+                }
+            }
+
+            // Add to combined openings mesh
+            combined_openings.merge(&extended_mesh);
+        }
+
+        // STEP 2: Do a single CSG subtraction with all openings combined
+        // This handles adjacent openings correctly
+        if !combined_openings.is_empty() {
+            if let Ok(subtracted) = clipper.subtract_mesh(&mesh, &combined_openings) {
+                // Basic sanity check: result must have triangles and valid geometry
+                let has_valid_positions = subtracted.positions.iter().all(|&v| v.is_finite());
+                let has_triangles = subtracted.triangle_count() > 0;
+
+                if has_triangles && has_valid_positions {
+                    mesh = subtracted;
+                }
+            }
+            // Keep original mesh if CSG fails
+        }
+
+        Ok(mesh)
     }
 
     /// Process building element and return geometry + transform separately
@@ -322,7 +544,15 @@ impl GeometryRouter {
                 if let Some(rep_type) = rep_type_attr.as_string() {
                     matches!(
                         rep_type,
-                        "Body" | "SweptSolid" | "Brep" | "CSG" | "Clipping" | "SurfaceModel" | "Tessellation" | "AdvancedSweptSolid" | "AdvancedBrep"
+                        "Body"
+                            | "SweptSolid"
+                            | "Brep"
+                            | "CSG"
+                            | "Clipping"
+                            | "SurfaceModel"
+                            | "Tessellation"
+                            | "AdvancedSweptSolid"
+                            | "AdvancedBrep"
                     )
                 } else {
                     false
@@ -345,7 +575,16 @@ impl GeometryRouter {
 
                     if !matches!(
                         rep_type,
-                        "Body" | "SweptSolid" | "Brep" | "CSG" | "Clipping" | "SurfaceModel" | "Tessellation" | "MappedRepresentation" | "AdvancedSweptSolid" | "AdvancedBrep"
+                        "Body"
+                            | "SweptSolid"
+                            | "Brep"
+                            | "CSG"
+                            | "Clipping"
+                            | "SurfaceModel"
+                            | "Tessellation"
+                            | "MappedRepresentation"
+                            | "AdvancedSweptSolid"
+                            | "AdvancedBrep"
                     ) {
                         continue;
                     }
@@ -406,8 +645,8 @@ impl GeometryRouter {
 
         // Check FacetedBrep cache first (from batch preprocessing)
         if item.ifc_type == IfcType::IfcFacetedBrep {
-            if let Some(mesh) = self.take_cached_faceted_brep(item.id) {
-                // FacetedBrep meshes are already processed, deduplicate by hash
+            if let Some(mut mesh) = self.take_cached_faceted_brep(item.id) {
+                self.scale_mesh(&mut mesh);
                 let cached = self.get_or_cache_by_hash(mesh);
                 return Ok((*cached).clone());
             }
@@ -415,7 +654,9 @@ impl GeometryRouter {
 
         // Check if we have a processor for this type
         if let Some(processor) = self.processors.get(&item.ifc_type) {
-            let mesh = processor.process(item, decoder, &self.schema)?;
+            let mut mesh = processor.process(item, decoder, &self.schema)?;
+            self.scale_mesh(&mut mesh);
+
             // Deduplicate by hash - buildings with repeated floors have identical geometry
             if !mesh.positions.is_empty() {
                 let cached = self.get_or_cache_by_hash(mesh);
@@ -490,10 +731,10 @@ impl GeometryRouter {
         {
             let cache = self.mapped_item_cache.borrow();
             if let Some(cached_mesh) = cache.get(&source_id) {
-                // Clone the cached mesh and apply MappingTarget transformation
                 let mut mesh = cached_mesh.as_ref().clone();
-                if let Some(transform) = &mapping_transform {
-                    self.transform_mesh(&mut mesh, transform);
+                if let Some(mut transform) = mapping_transform {
+                    self.scale_transform(&mut transform);
+                    self.transform_mesh(&mut mesh, &transform);
                 }
                 return Ok(mesh);
             }
@@ -504,11 +745,9 @@ impl GeometryRouter {
         // 0: MappingOrigin (IfcAxis2Placement)
         // 1: MappedRepresentation (IfcRepresentation)
 
-        let mapped_rep_attr = source_entity
-            .get(1)
-            .ok_or_else(|| {
-                Error::geometry("RepresentationMap missing MappedRepresentation".to_string())
-            })?;
+        let mapped_rep_attr = source_entity.get(1).ok_or_else(|| {
+            Error::geometry("RepresentationMap missing MappedRepresentation".to_string())
+        })?;
 
         let mapped_rep = decoder
             .resolve_ref(mapped_rep_attr)?
@@ -528,7 +767,8 @@ impl GeometryRouter {
                 continue; // Skip nested MappedItems to avoid recursion
             }
             if let Some(processor) = self.processors.get(&sub_item.ifc_type) {
-                if let Ok(sub_mesh) = processor.process(&sub_item, decoder, &self.schema) {
+                if let Ok(mut sub_mesh) = processor.process(&sub_item, decoder, &self.schema) {
+                    self.scale_mesh(&mut sub_mesh);
                     mesh.merge(&sub_mesh);
                 }
             }
@@ -541,8 +781,9 @@ impl GeometryRouter {
         }
 
         // Apply MappingTarget transformation to this instance
-        if let Some(transform) = &mapping_transform {
-            self.transform_mesh(&mut mesh, transform);
+        if let Some(mut transform) = mapping_transform {
+            self.scale_transform(&mut transform);
+            self.transform_mesh(&mut mesh, &transform);
         }
 
         Ok(mesh)
@@ -555,7 +796,6 @@ impl GeometryRouter {
         decoder: &mut EntityDecoder,
         mesh: &mut Mesh,
     ) -> Result<()> {
-        // Get ObjectPlacement (attribute 5)
         let placement_attr = match element.get(5) {
             Some(attr) if !attr.is_null() => attr,
             _ => return Ok(()), // No placement
@@ -566,8 +806,8 @@ impl GeometryRouter {
             None => return Ok(()),
         };
 
-        // Recursively get combined transform from placement hierarchy
-        let transform = self.get_placement_transform(&placement, decoder)?;
+        let mut transform = self.get_placement_transform(&placement, decoder)?;
+        self.scale_transform(&mut transform);
         self.transform_mesh(mesh, &transform);
         Ok(())
     }
@@ -713,18 +953,9 @@ impl GeometryRouter {
             .as_list()
             .ok_or_else(|| Error::geometry("Expected coordinate list".to_string()))?;
 
-        let x = coords
-            .get(0)
-            .and_then(|v| v.as_float())
-            .unwrap_or(0.0);
-        let y = coords
-            .get(1)
-            .and_then(|v| v.as_float())
-            .unwrap_or(0.0);
-        let z = coords
-            .get(2)
-            .and_then(|v| v.as_float())
-            .unwrap_or(0.0);
+        let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+        let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+        let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
 
         Ok(Point3::new(x, y, z))
     }
@@ -748,7 +979,7 @@ impl GeometryRouter {
             .as_list()
             .ok_or_else(|| Error::geometry("Expected ratio list".to_string()))?;
 
-        let x = ratios.get(0).and_then(|v| v.as_float()).unwrap_or(0.0);
+        let x = ratios.first().and_then(|v| v.as_float()).unwrap_or(0.0);
         let y = ratios.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
         let z = ratios.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
 
@@ -778,7 +1009,7 @@ impl GeometryRouter {
                         let coords_attr = origin_entity.get(0);
                         if let Some(coords) = coords_attr.and_then(|a| a.as_list()) {
                             Point3::new(
-                                coords.get(0).and_then(|v| v.as_float()).unwrap_or(0.0),
+                                coords.first().and_then(|v| v.as_float()).unwrap_or(0.0),
                                 coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0),
                                 coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0),
                             )
@@ -858,11 +1089,7 @@ impl GeometryRouter {
     fn transform_mesh(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
         // Use chunks for better cache locality and less indexing overhead
         mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
-            let point = Point3::new(
-                chunk[0] as f64,
-                chunk[1] as f64,
-                chunk[2] as f64,
-            );
+            let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
             let transformed = transform.transform_point(&point);
             chunk[0] = transformed.x as f32;
             chunk[1] = transformed.y as f32;
@@ -872,11 +1099,7 @@ impl GeometryRouter {
         // Transform normals (without translation) - optimized chunk iteration
         let rotation = transform.fixed_view::<3, 3>(0, 0);
         mesh.normals.chunks_exact_mut(3).for_each(|chunk| {
-            let normal = Vector3::new(
-                chunk[0] as f64,
-                chunk[1] as f64,
-                chunk[2] as f64,
-            );
+            let normal = Vector3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
             let transformed = (rotation * normal).normalize();
             chunk[0] = transformed.x as f32;
             chunk[1] = transformed.y as f32;
@@ -918,7 +1141,9 @@ mod tests {
         let router = GeometryRouter::new();
 
         let wall = decoder.decode_by_id(2).unwrap();
-        let point = router.parse_cartesian_point(&wall, &mut decoder, 6).unwrap();
+        let point = router
+            .parse_cartesian_point(&wall, &mut decoder, 6)
+            .unwrap();
 
         assert_eq!(point.x, 100.0);
         assert_eq!(point.y, 200.0);

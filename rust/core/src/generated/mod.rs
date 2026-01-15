@@ -9,15 +9,11 @@
 //! Note: The IfcType enum is renamed to FullIfcType to avoid conflicts
 //! with the main schema::IfcType enum.
 
-mod type_ids;
 mod schema;
-mod geometry_categories;
+mod type_ids;
 
 // Re-export type IDs (these are just constants, no conflict)
 pub use type_ids::*;
 
-// Re-export the full generated IfcType as FullIfcType to avoid conflict
-pub use schema::IfcType as FullIfcType;
-
-// Re-export geometry categories (no conflict as main code uses schema_gen)
-pub use geometry_categories::{GeometryCategory as FullGeometryCategory, ProfileCategory as FullProfileCategory};
+// Re-export the generated IfcType directly (this is now the canonical schema)
+pub use schema::{has_geometry_by_name, IfcType};
