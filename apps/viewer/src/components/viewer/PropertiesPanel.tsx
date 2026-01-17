@@ -62,11 +62,27 @@ export function PropertiesPanel() {
     };
   }, [selectedEntityId, ifcDataStore]);
 
-  // Get quantities
-  const quantities = useMemo((): QuantitySet[] => {
-    if (!selectedEntityId || !ifcDataStore?.quantities) return [];
-    return ifcDataStore.quantities.getForEntity(selectedEntityId);
-  }, [selectedEntityId, ifcDataStore]);
+  // Get entity node - must be computed before early return to maintain hook order
+  const entityNode = useMemo(() => {
+    if (!selectedEntityId || !query) return null;
+    return query.entity(selectedEntityId);
+  }, [selectedEntityId, query]);
+
+  // Unified property/quantity access - EntityNode handles on-demand extraction automatically
+  // These hooks must be called before any early return to maintain hook order
+  const properties: PropertySet[] = useMemo(() => {
+    if (!entityNode) return [];
+    const rawProps = entityNode.properties();
+    return rawProps.map(pset => ({
+      name: pset.name,
+      properties: pset.properties.map(p => ({ name: p.name, value: p.value })),
+    }));
+  }, [entityNode]);
+
+  const quantities: QuantitySet[] = useMemo(() => {
+    if (!entityNode) return [];
+    return entityNode.quantities();
+  }, [entityNode]);
 
   if (!selectedEntityId || !query) {
     return (
@@ -81,11 +97,10 @@ export function PropertiesPanel() {
     );
   }
 
-  const entityNode = query.entity(selectedEntityId);
-  const properties: PropertySet[] = entityNode.properties();
-  const entityType = entityNode.type;
-  const entityName = entityNode.name;
-  const entityGlobalId = entityNode.globalId;
+  // These are safe to access after the early return check
+  const entityType = entityNode!.type;
+  const entityName = entityNode!.name;
+  const entityGlobalId = entityNode!.globalId;
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);

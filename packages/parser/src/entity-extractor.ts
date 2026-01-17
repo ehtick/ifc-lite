@@ -55,24 +55,24 @@ export class EntityExtractor {
     let depth = 0;
     let current = '';
     let inString = false;
-    let escapeNext = false;
 
     for (let i = 0; i < paramsText.length; i++) {
       const char = paramsText[i];
 
-      if (escapeNext) {
-        current += char;
-        escapeNext = false;
-        continue;
-      }
-
       if (char === "'") {
-        inString = !inString;
+        if (inString) {
+          // Check for escaped quote ('') - STEP uses doubled quotes
+          if (i + 1 < paramsText.length && paramsText[i + 1] === "'") {
+            current += "''"; // Keep the escaped quote
+            i++; // Skip next quote
+            continue;
+          }
+          inString = false;
+        } else {
+          inString = true;
+        }
         current += char;
       } else if (inString) {
-        if (char === '\\') {
-          escapeNext = true;
-        }
         current += char;
       } else if (char === '(') {
         depth++;
@@ -102,6 +102,16 @@ export class EntityExtractor {
 
     if (!value || value === '$') {
       return null;
+    }
+
+    // TypedValue: IFCTYPENAME(value) - must check before list check
+    // Pattern: identifier followed by parentheses (e.g., IFCNORMALISEDRATIOMEASURE(0.5))
+    const typedValueMatch = value.match(/^([A-Z][A-Z0-9_]*)\((.+)\)$/i);
+    if (typedValueMatch) {
+      const typeName = typedValueMatch[1];
+      const innerValue = typedValueMatch[2].trim();
+      // Return as array [typeName, parsedValue] to match Rust structure
+      return [typeName, this.parseAttributeValue(innerValue)];
     }
 
     // List/Array: (#123) or (#123, #456) or ()
@@ -153,7 +163,8 @@ export class EntityExtractor {
 
     // String: 'text'
     if (value.startsWith("'") && value.endsWith("'")) {
-      return value.slice(1, -1).replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+      // STEP uses doubled quotes ('') for escaping, not backslash
+      return value.slice(1, -1).replace(/''/g, "'");
     }
 
     // Number

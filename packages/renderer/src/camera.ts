@@ -1016,6 +1016,49 @@ export class Camera {
    * @param canvasHeight - Canvas height in pixels
    * @returns Screen coordinates { x, y } or null if behind camera
    */
+  /**
+   * Unproject screen coordinates to a ray in world space
+   * @param screenX - X position in screen coordinates
+   * @param screenY - Y position in screen coordinates
+   * @param canvasWidth - Canvas width in pixels
+   * @param canvasHeight - Canvas height in pixels
+   * @returns Ray origin and direction in world space
+   */
+  unprojectToRay(screenX: number, screenY: number, canvasWidth: number, canvasHeight: number): { origin: Vec3; direction: Vec3 } {
+    // For perspective camera, ray origin is always the camera position
+    // Direction is computed through the screen point
+
+    // Convert screen coords to NDC (-1 to 1)
+    const ndcX = (screenX / canvasWidth) * 2 - 1;
+    const ndcY = 1 - (screenY / canvasHeight) * 2; // Flip Y
+
+    // Invert the view-projection matrix
+    const invViewProj = MathUtils.invert(this.viewProjMatrix);
+    if (!invViewProj) {
+      // Fallback: return ray from camera position towards target
+      const dir = MathUtils.normalize({
+        x: this.camera.target.x - this.camera.position.x,
+        y: this.camera.target.y - this.camera.position.y,
+        z: this.camera.target.z - this.camera.position.z,
+      });
+      return { origin: { ...this.camera.position }, direction: dir };
+    }
+
+    // Unproject a point at some depth to get a point on the ray
+    // Using z=0.5 (midpoint in Reverse-Z: 1.0=near, 0.0=far) to get a finite point
+    const worldPoint = MathUtils.transformPoint(invViewProj, { x: ndcX, y: ndcY, z: 0.5 });
+
+    // Ray origin is camera position, direction is towards unprojected point
+    const origin = { ...this.camera.position };
+    const direction = MathUtils.normalize({
+      x: worldPoint.x - origin.x,
+      y: worldPoint.y - origin.y,
+      z: worldPoint.z - origin.z,
+    });
+
+    return { origin, direction };
+  }
+
   projectToScreen(worldPos: Vec3, canvasWidth: number, canvasHeight: number): { x: number; y: number } | null {
     // Transform world position by view-projection matrix
     const m = this.viewProjMatrix.m;
