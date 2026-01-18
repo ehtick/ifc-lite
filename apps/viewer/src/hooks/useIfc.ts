@@ -229,6 +229,7 @@ export function useIfc() {
   /**
    * Rebuild on-demand property/quantity maps from relationships and entity types
    * Uses FORWARD direction: pset -> elements (more efficient than inverse lookup)
+   * OPTIMIZED: Uses getByType() instead of iterating all entities
    */
   const rebuildOnDemandMaps = (
     entities: EntityTable,
@@ -237,42 +238,36 @@ export function useIfc() {
     const onDemandPropertyMap = new Map<number, number[]>();
     const onDemandQuantityMap = new Map<number, number[]>();
 
-    let psetCount = 0;
-    let qsetCount = 0;
+    // PERF: Use getByType() instead of iterating ALL entities
+    // This eliminates O(n²) linear searches through expressId array
+    const propertySets = entities.getByType(IfcTypeEnum.IfcPropertySet);
+    const quantitySets = entities.getByType(IfcTypeEnum.IfcElementQuantity);
 
-    // Find all property sets and quantity sets, then look up what they define
-    for (let i = 0; i < entities.count; i++) {
-      const psetId = entities.expressId[i];
-      const psetType = entities.getTypeName(psetId);
-      const psetTypeUpper = psetType?.toUpperCase() || '';
-
-      // Only process property sets and quantity sets
-      const isPropertySet = psetTypeUpper === 'IFCPROPERTYSET';
-      const isQuantitySet = psetTypeUpper === 'IFCELEMENTQUANTITY';
-      if (!isPropertySet && !isQuantitySet) {
-        continue;
-      }
-
-      if (isPropertySet) psetCount++;
-      if (isQuantitySet) qsetCount++;
-
+    // Process property sets
+    for (const psetId of propertySets) {
       // Get elements defined by this pset (FORWARD: pset -> elements)
       const definedElements = relationships.getRelated(psetId, RelationshipType.DefinesByProperties, 'forward');
 
       for (const entityId of definedElements) {
-        if (isPropertySet) {
-          let list = onDemandPropertyMap.get(entityId);
-          if (!list) { list = []; onDemandPropertyMap.set(entityId, list); }
-          list.push(psetId);
-        } else {
-          let list = onDemandQuantityMap.get(entityId);
-          if (!list) { list = []; onDemandQuantityMap.set(entityId, list); }
-          list.push(psetId);
-        }
+        let list = onDemandPropertyMap.get(entityId);
+        if (!list) { list = []; onDemandPropertyMap.set(entityId, list); }
+        list.push(psetId);
       }
     }
 
-    console.log(`[useIfc] Rebuilt on-demand maps: ${psetCount} psets, ${qsetCount} qsets -> ${onDemandPropertyMap.size} entities with properties, ${onDemandQuantityMap.size} with quantities`);
+    // Process quantity sets
+    for (const qsetId of quantitySets) {
+      // Get elements defined by this qset (FORWARD: qset -> elements)
+      const definedElements = relationships.getRelated(qsetId, RelationshipType.DefinesByProperties, 'forward');
+
+      for (const entityId of definedElements) {
+        let list = onDemandQuantityMap.get(entityId);
+        if (!list) { list = []; onDemandQuantityMap.set(entityId, list); }
+        list.push(qsetId);
+      }
+    }
+
+    console.log(`[useIfc] Rebuilt on-demand maps: ${propertySets.length} psets, ${quantitySets.length} qsets -> ${onDemandPropertyMap.size} entities with properties, ${onDemandQuantityMap.size} with quantities`);
     return { onDemandPropertyMap, onDemandQuantityMap };
   };
 
@@ -937,20 +932,9 @@ export function useIfc() {
 
           // ===== PropertyTable with getForEntity =====
           // Build entity -> pset relationships from server data
+          // NOTE: This is now built in the combined relationship loop below (lines ~1028-1055)
+          // to avoid iterating relationships twice
           const entityToPsets = new Map<number, Array<{ pset_id: number; pset_name: string; properties: Array<{ property_name: string; property_value: string; property_type: string }> }>>();
-
-          // Parse relationships to link entities to their property sets
-          for (const rel of dataModel.relationships) {
-            if (rel.rel_type === 'IFCRELDEFINESBYPROPERTIES') {
-              const pset = dataModel.propertySets.get(rel.relating_id);
-              if (pset) {
-                if (!entityToPsets.has(rel.related_id)) {
-                  entityToPsets.set(rel.related_id, []);
-                }
-                entityToPsets.get(rel.related_id)!.push(pset);
-              }
-            }
-          }
 
           const properties = {
             count: 0,
@@ -1006,27 +990,72 @@ export function useIfc() {
           const forwardEdges = new Map<number, Array<{ target: number; type: RelationshipType; relationshipId: number }>>();
           const inverseEdges = new Map<number, Array<{ target: number; type: RelationshipType; relationshipId: number }>>();
 
+          // PERF: Pre-compute uppercase once for efficient comparison
+          // This eliminates millions of .toUpperCase() calls for large files
+          // IMPORTANT: Keep in sync with columnar-parser.ts REL_TYPE_MAP (14 types total)
+          // This map MUST cover ALL RelationshipType enum values to prevent semantic loss
+          const relTypeMap = new Map<string, RelationshipType>([
+            ['IFCRELCONTAINEDINSPATIALSTRUCTURE', RelationshipType.ContainsElements],
+            ['IFCRELAGGREGATES', RelationshipType.Aggregates],
+            ['IFCRELDEFINESBYPROPERTIES', RelationshipType.DefinesByProperties],
+            ['IFCRELDEFINESBYTYPE', RelationshipType.DefinesByType],
+            ['IFCRELASSOCIATESMATERIAL', RelationshipType.AssociatesMaterial],
+            ['IFCRELASSOCIATESCLASSIFICATION', RelationshipType.AssociatesClassification],
+            ['IFCRELVOIDSELEMENT', RelationshipType.VoidsElement],
+            ['IFCRELFILLSELEMENT', RelationshipType.FillsElement],
+            ['IFCRELCONNECTSPATHELEMENTS', RelationshipType.ConnectsPathElements],
+            ['IFCRELCONNECTSELEMENTS', RelationshipType.ConnectsElements],
+            ['IFCRELSPACEBOUNDARY', RelationshipType.SpaceBoundary],
+            ['IFCRELASSIGNSTOGROUP', RelationshipType.AssignsToGroup],
+            ['IFCRELASSIGNSTOPRODUCT', RelationshipType.AssignsToProduct],
+            ['IFCRELREFERENCEDINSPATIALSTRUCTURE', RelationshipType.ReferencedInSpatialStructure],
+          ]);
+
+          // Track unmapped relationship types for diagnostics
+          const unmappedRelTypes = new Set<string>();
+
+          // PERF: Combined loop - process relationships once for both graph building AND property mapping
+          // This eliminates the duplicate loop that was doing 1M string comparisons
           for (const rel of dataModel.relationships) {
-            const relType = rel.rel_type.toUpperCase().includes('AGGREGATE') ? RelationshipType.Aggregates
-              : rel.rel_type.toUpperCase().includes('CONTAINED') ? RelationshipType.ContainsElements
-                : rel.rel_type.toUpperCase().includes('DEFINESBYPROP') ? RelationshipType.DefinesByProperties
-                  : rel.rel_type.toUpperCase().includes('DEFINESBYTYPE') ? RelationshipType.DefinesByType
-                    : rel.rel_type.toUpperCase().includes('MATERIAL') ? RelationshipType.AssociatesMaterial
-                      : rel.rel_type.toUpperCase().includes('VOIDS') ? RelationshipType.VoidsElement
-                        : rel.rel_type.toUpperCase().includes('FILLS') ? RelationshipType.FillsElement
-                          : RelationshipType.Aggregates;
+            // Single .toUpperCase() call instead of 7
+            const upperType = rel.rel_type.toUpperCase();
+            const relType = relTypeMap.get(upperType);
+
+            // Log unmapped types (helps identify missing IFC relationship types)
+            if (relType === undefined && !unmappedRelTypes.has(upperType)) {
+              unmappedRelTypes.add(upperType);
+              console.debug(`[useIfc] Unmapped relationship type: ${rel.rel_type}`);
+            }
+
+            const finalRelType = relType ?? RelationshipType.Aggregates;
+
+            // Build property set mapping in the same loop (avoid duplicate iteration)
+            if (upperType === 'IFCRELDEFINESBYPROPERTIES') {
+              const pset = dataModel.propertySets.get(rel.relating_id);
+              if (pset) {
+                if (!entityToPsets.has(rel.related_id)) {
+                  entityToPsets.set(rel.related_id, []);
+                }
+                entityToPsets.get(rel.related_id)!.push(pset);
+              }
+            }
 
             // Forward: relating -> related
             if (!forwardEdges.has(rel.relating_id)) {
               forwardEdges.set(rel.relating_id, []);
             }
-            forwardEdges.get(rel.relating_id)!.push({ target: rel.related_id, type: relType, relationshipId: 0 });
+            forwardEdges.get(rel.relating_id)!.push({ target: rel.related_id, type: finalRelType, relationshipId: 0 });
 
             // Inverse: related -> relating
             if (!inverseEdges.has(rel.related_id)) {
               inverseEdges.set(rel.related_id, []);
             }
-            inverseEdges.get(rel.related_id)!.push({ target: rel.relating_id, type: relType, relationshipId: 0 });
+            inverseEdges.get(rel.related_id)!.push({ target: rel.relating_id, type: finalRelType, relationshipId: 0 });
+          }
+
+          // Log summary of unmapped relationship types
+          if (unmappedRelTypes.size > 0) {
+            console.warn(`[useIfc] Found ${unmappedRelTypes.size} unmapped relationship types: ${Array.from(unmappedRelTypes).join(', ')}`);
           }
 
           const createEdgeAccessor = (edges: Map<number, Array<{ target: number; type: RelationshipType; relationshipId: number }>>) => ({
