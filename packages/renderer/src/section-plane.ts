@@ -7,31 +7,55 @@
  */
 
 export interface SectionPlaneRenderOptions {
-  axis: 'x' | 'y' | 'z';
+  axis: 'down' | 'front' | 'side';  // Semantic axis names: down (Y), front (Z), side (X)
   position: number; // 0-100 percentage
   bounds: {
     min: { x: number; y: number; z: number };
     max: { x: number; y: number; z: number };
   };
   viewProj: Float32Array;
+  flipped?: boolean; // If true, show the opposite side indicator
+  isPreview?: boolean; // If true, render as preview (less opacity)
+  min?: number;      // Optional override for min range value
+  max?: number;      // Optional override for max range value
 }
 
 export class SectionPlaneRenderer {
   private device: GPUDevice;
-  private pipeline: GPURenderPipeline | null = null;
+  private bindGroupLayout: GPUBindGroupLayout | null = null;  // Shared layout for both pipelines
+  private previewPipeline: GPURenderPipeline | null = null;   // With depth test (respects geometry)
+  private cutPipeline: GPURenderPipeline | null = null;       // No depth test (always visible)
   private vertexBuffer: GPUBuffer | null = null;
   private uniformBuffer: GPUBuffer | null = null;
   private bindGroup: GPUBindGroup | null = null;
   private format: GPUTextureFormat;
+  private sampleCount: number;
   private initialized = false;
 
-  constructor(device: GPUDevice, format: GPUTextureFormat) {
+  constructor(device: GPUDevice, format: GPUTextureFormat, sampleCount: number = 4) {
     this.device = device;
     this.format = format;
+    this.sampleCount = sampleCount;
   }
 
   private init(): void {
     if (this.initialized) return;
+
+    // Create explicit bind group layout (shared between both pipelines)
+    this.bindGroupLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: 'uniform' },
+        },
+      ],
+    });
+
+    // Create pipeline layout using the shared bind group layout
+    const pipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [this.bindGroupLayout],
+    });
 
     // Create shader for section plane rendering
     const shaderModule = this.device.createShaderModule({
@@ -57,34 +81,60 @@ export class SectionPlaneRenderer {
 
         @fragment
         fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-          // Create a grid pattern on the plane
-          let gridSize = 0.05;
-          let lineWidth = 0.02;
+          // Create fine grid pattern
+          let gridSize = 0.01;           // Fine grid cells (100 divisions)
+          let lineWidth = 0.001;         // Very thin lines
+          let majorGridSize = 0.1;       // Major grid every 10 cells
+          let majorLineWidth = 0.002;    // Slightly thicker major lines
 
+          // Minor grid
           let gridX = abs(fract(input.uv.x / gridSize + 0.5) - 0.5);
           let gridY = abs(fract(input.uv.y / gridSize + 0.5) - 0.5);
+          let isMinorGridLine = min(gridX, gridY) < lineWidth;
 
-          let gridLine = min(gridX, gridY);
-          let isGridLine = gridLine < lineWidth;
+          // Major grid (every 10 cells)
+          let majorX = abs(fract(input.uv.x / majorGridSize + 0.5) - 0.5);
+          let majorY = abs(fract(input.uv.y / majorGridSize + 0.5) - 0.5);
+          let isMajorGridLine = min(majorX, majorY) < majorLineWidth;
 
-          // Edge fade for softer appearance
-          let edgeFade = smoothstep(0.0, 0.1, min(input.uv.x, min(input.uv.y, min(1.0 - input.uv.x, 1.0 - input.uv.y))));
+          // Soft edge fade
+          let edgeDist = min(input.uv.x, min(input.uv.y, min(1.0 - input.uv.x, 1.0 - input.uv.y)));
+          let edgeFade = smoothstep(0.0, 0.08, edgeDist);
+
+          // Subtle border
+          let borderGlow = 1.0 - smoothstep(0.0, 0.03, edgeDist);
 
           var color = uniforms.planeColor;
-          if (isGridLine) {
-            color = vec4<f32>(color.rgb * 1.3, color.a * 1.5);
+
+          // Layered rendering: base fill + minor grid + major grid + border
+          if (isMajorGridLine) {
+            // Major grid lines - subtle white
+            color = vec4<f32>(1.0, 1.0, 1.0, color.a * 1.5);
+          } else if (isMinorGridLine) {
+            // Minor grid lines - slightly brighter
+            color = vec4<f32>(color.rgb * 1.3, color.a * 1.2);
           }
 
+          // Add subtle border
+          color = vec4<f32>(
+            mix(color.rgb, vec3<f32>(1.0, 1.0, 1.0), borderGlow * 0.3),
+            color.a + borderGlow * 0.2
+          );
+
+          // Apply edge fade
           color.a *= edgeFade;
+
+          // Clamp alpha
+          color.a = min(color.a, 0.5);
 
           return color;
         }
       `,
     });
 
-    // Create render pipeline with alpha blending
-    this.pipeline = this.device.createRenderPipeline({
-      layout: 'auto',
+    // Shared pipeline config (now using explicit layout)
+    const pipelineBase = {
+      layout: pipelineLayout,
       vertex: {
         module: shaderModule,
         entryPoint: 'vs_main',
@@ -92,8 +142,8 @@ export class SectionPlaneRenderer {
           {
             arrayStride: 20, // 3 position + 2 uv = 5 floats
             attributes: [
-              { shaderLocation: 0, offset: 0, format: 'float32x3' },
-              { shaderLocation: 1, offset: 12, format: 'float32x2' },
+              { shaderLocation: 0, offset: 0, format: 'float32x3' as const },
+              { shaderLocation: 1, offset: 12, format: 'float32x2' as const },
             ],
           },
         ],
@@ -105,26 +155,44 @@ export class SectionPlaneRenderer {
           format: this.format,
           blend: {
             color: {
-              srcFactor: 'src-alpha',
-              dstFactor: 'one-minus-src-alpha',
-              operation: 'add',
+              srcFactor: 'src-alpha' as const,
+              dstFactor: 'one-minus-src-alpha' as const,
+              operation: 'add' as const,
             },
             alpha: {
-              srcFactor: 'one',
-              dstFactor: 'one-minus-src-alpha',
-              operation: 'add',
+              srcFactor: 'one' as const,
+              dstFactor: 'one-minus-src-alpha' as const,
+              operation: 'add' as const,
             },
           },
         }],
       },
       primitive: {
-        topology: 'triangle-list',
-        cullMode: 'none',
+        topology: 'triangle-list' as const,
+        cullMode: 'none' as const,
       },
+      multisample: {
+        count: this.sampleCount,
+      },
+    };
+
+    // Preview pipeline: only draw where there's NO geometry (behind/around building)
+    this.previewPipeline = this.device.createRenderPipeline({
+      ...pipelineBase,
       depthStencil: {
         format: 'depth24plus',
-        depthWriteEnabled: false, // Don't write to depth buffer (transparent)
-        depthCompare: 'less-equal',
+        depthWriteEnabled: false,
+        depthCompare: 'greater',  // Only draw where plane is behind geometry (empty space)
+      },
+    });
+
+    // Cut pipeline: always visible (shows where the cut is)
+    this.cutPipeline = this.device.createRenderPipeline({
+      ...pipelineBase,
+      depthStencil: {
+        format: 'depth24plus',
+        depthWriteEnabled: false,
+        depthCompare: 'always',  // Always draw on top
       },
     });
 
@@ -140,9 +208,9 @@ export class SectionPlaneRenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // Create bind group
+    // Create bind group using explicit layout (compatible with both pipelines)
     this.bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
+      layout: this.bindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
       ],
@@ -151,78 +219,91 @@ export class SectionPlaneRenderer {
     this.initialized = true;
   }
 
-  render(
-    encoder: GPUCommandEncoder,
-    textureView: GPUTextureView,
-    depthView: GPUTextureView,
+  /**
+   * Draw section plane into an existing render pass (preferred - avoids MSAA mismatch)
+   */
+  draw(
+    pass: GPURenderPassEncoder,
     options: SectionPlaneRenderOptions
   ): void {
     this.init();
 
-    if (!this.pipeline || !this.vertexBuffer || !this.uniformBuffer || !this.bindGroup) {
+    if (!this.previewPipeline || !this.cutPipeline || !this.vertexBuffer || !this.uniformBuffer || !this.bindGroup) {
       return;
     }
 
-    const { axis, position, bounds, viewProj } = options;
+    const { axis, position, bounds, viewProj, isPreview, min: minOverride, max: maxOverride } = options;
+
+    // Only draw section plane in preview mode - hide it during active cutting
+    if (!isPreview) {
+      return;
+    }
 
     // Calculate plane vertices based on axis and bounds
-    const vertices = this.calculatePlaneVertices(axis, position, bounds);
+    const vertices = this.calculatePlaneVertices(axis, position, bounds, 0, minOverride, maxOverride);
     this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices);
 
     // Update uniforms
     const uniforms = new Float32Array(20);
     uniforms.set(viewProj, 0);
-    // Plane color - semi-transparent blue/cyan
-    uniforms[16] = 0.2;  // R
-    uniforms[17] = 0.6;  // G
-    uniforms[18] = 0.9;  // B
-    uniforms[19] = 0.3;  // A (transparency)
+
+    // Axis-specific colors for better identification
+    // down (Y) = light blue, front (Z) = green, side (X) = orange
+    if (axis === 'down') {
+      uniforms[16] = 0.012; // R - #03A9F4
+      uniforms[17] = 0.663; // G
+      uniforms[18] = 0.957; // B
+    } else if (axis === 'front') {
+      uniforms[16] = 0.298; // R - #4CAF50
+      uniforms[17] = 0.686; // G
+      uniforms[18] = 0.314; // B
+    } else {
+      uniforms[16] = 1.0;   // R - #FF9800
+      uniforms[17] = 0.596; // G
+      uniforms[18] = 0.0;   // B
+    }
+    // Preview mode opacity
+    uniforms[19] = 0.25;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniforms);
 
-    // Render the section plane
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: textureView,
-        loadOp: 'load', // Keep existing content
-        storeOp: 'store',
-      }],
-      depthStencilAttachment: {
-        view: depthView,
-        depthLoadOp: 'load',
-        depthStoreOp: 'store',
-      },
-    });
-
-    pass.setPipeline(this.pipeline);
+    // Draw section plane with preview pipeline (respects depth)
+    pass.setPipeline(this.previewPipeline!);
     pass.setBindGroup(0, this.bindGroup);
     pass.setVertexBuffer(0, this.vertexBuffer);
     pass.draw(6); // 2 triangles
-    pass.end();
   }
 
   private calculatePlaneVertices(
-    axis: 'x' | 'y' | 'z',
+    axis: 'down' | 'front' | 'side',
     position: number,
-    bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }
+    bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } },
+    inset: number = 0,  // 0 = full size, 0.15 = 15% smaller on each side
+    minOverride?: number,
+    maxOverride?: number
   ): Float32Array {
     const { min, max } = bounds;
 
-    // Add some padding to make the plane slightly larger than the model
-    const padding = 0.1;
-    const sizeX = (max.x - min.x) * (1 + padding);
-    const sizeY = (max.y - min.y) * (1 + padding);
-    const sizeZ = (max.z - min.z) * (1 + padding);
+    // Calculate base size with 10% padding for preview
+    const basePadding = 0.1;
+    const effectiveScale = (1 + basePadding) * (1 - inset * 2);
+    const sizeX = (max.x - min.x) * effectiveScale;
+    const sizeY = (max.y - min.y) * effectiveScale;
+    const sizeZ = (max.z - min.z) * effectiveScale;
     const centerX = (min.x + max.x) / 2;
     const centerY = (min.y + max.y) / 2;
     const centerZ = (min.z + max.z) / 2;
 
     // Calculate the plane position along the axis
     const t = position / 100;
+    const axisIdx = axis === 'side' ? 'x' : axis === 'down' ? 'y' : 'z';
+    const axisMin = minOverride ?? min[axisIdx];
+    const axisMax = maxOverride ?? max[axisIdx];
 
     let vertices: number[] = [];
 
-    if (axis === 'x') {
-      const x = min.x + t * (max.x - min.x);
+    if (axis === 'side') {
+      // Side = X axis (YZ plane)
+      const x = axisMin + t * (axisMax - axisMin);
       const halfY = sizeY / 2;
       const halfZ = sizeZ / 2;
       // Quad facing X axis (vertices in YZ plane)
@@ -236,8 +317,9 @@ export class SectionPlaneRenderer {
         x, centerY + halfY, centerZ + halfZ, 1, 1,
         x, centerY - halfY, centerZ + halfZ, 0, 1,
       ];
-    } else if (axis === 'y') {
-      const y = min.y + t * (max.y - min.y);
+    } else if (axis === 'down') {
+      // Down = Y axis (XZ plane) - horizontal cut
+      const y = axisMin + t * (axisMax - axisMin);
       const halfX = sizeX / 2;
       const halfZ = sizeZ / 2;
       // Quad facing Y axis (vertices in XZ plane)
@@ -252,7 +334,8 @@ export class SectionPlaneRenderer {
         centerX - halfX, y, centerZ + halfZ, 0, 1,
       ];
     } else {
-      const z = min.z + t * (max.z - min.z);
+      // Front = Z axis (XY plane)
+      const z = axisMin + t * (axisMax - axisMin);
       const halfX = sizeX / 2;
       const halfY = sizeY / 2;
       // Quad facing Z axis (vertices in XY plane)
