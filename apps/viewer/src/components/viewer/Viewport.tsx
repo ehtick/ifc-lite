@@ -7,9 +7,30 @@
  */
 
 import { useEffect, useRef, useState, useMemo } from 'react';
-import { Renderer, MathUtils } from '@ifc-lite/renderer';
+import { Renderer, MathUtils, type SnapTarget } from '@ifc-lite/renderer';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
-import { useViewerStore, type MeasurePoint } from '@/store';
+import { useViewerStore, type MeasurePoint, type SnapVisualization } from '@/store';
+import {
+  useSelectionState,
+  useVisibilityState,
+  useToolState,
+  useMeasurementState,
+  useCameraState,
+  useHoverState,
+  useThemeState,
+  useContextMenuState,
+  useColorUpdateState,
+  useIfcDataState,
+} from '../../hooks/useViewerSelectors.js';
+import {
+  getEntityBounds,
+  getEntityCenter,
+  buildRenderOptions,
+  getRenderThrottleMs,
+  getThemeClearColor,
+  calculateScaleBarSize,
+  type ViewportStateRefs,
+} from '../../utils/viewportUtils.js';
 
 interface ViewportProps {
   geometry: MeshData[] | null;
@@ -21,52 +42,57 @@ export function Viewport({ geometry, coordinateInfo, computedIsolatedIds }: View
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
-  const selectedEntityId = useViewerStore((state) => state.selectedEntityId);
-  const setSelectedEntityId = useViewerStore((state) => state.setSelectedEntityId);
-  const hiddenEntities = useViewerStore((state) => state.hiddenEntities);
-  // Use computedIsolatedIds from parent (includes storey selection) instead of store's isolatedEntities
-  const isolatedEntities = computedIsolatedIds ?? null;
-  const activeTool = useViewerStore((state) => state.activeTool);
-  const updateCameraRotationRealtime = useViewerStore((state) => state.updateCameraRotationRealtime);
-  const updateScaleRealtime = useViewerStore((state) => state.updateScaleRealtime);
-  const setCameraCallbacks = useViewerStore((state) => state.setCameraCallbacks);
-  const theme = useViewerStore((state) => state.theme);
 
-  // New store subscriptions for enhanced features
-  const setHoverState = useViewerStore((state) => state.setHoverState);
-  const clearHover = useViewerStore((state) => state.clearHover);
-  const hoverTooltipsEnabled = useViewerStore((state) => state.hoverTooltipsEnabled);
-  const openContextMenu = useViewerStore((state) => state.openContextMenu);
-  const toggleSelection = useViewerStore((state) => state.toggleSelection);
-  const pendingMeasurePoint = useViewerStore((state) => state.pendingMeasurePoint);
-  const addMeasurePoint = useViewerStore((state) => state.addMeasurePoint);
-  const completeMeasurement = useViewerStore((state) => state.completeMeasurement);
-  const sectionPlane = useViewerStore((state) => state.sectionPlane);
+  // Selection state
+  const { selectedEntityId, selectedEntityIds, setSelectedEntityId, toggleSelection } = useSelectionState();
 
-  // New drag-based measurement store subscriptions
-  const activeMeasurement = useViewerStore((state) => state.activeMeasurement);
-  const startMeasurement = useViewerStore((state) => state.startMeasurement);
-  const updateMeasurement = useViewerStore((state) => state.updateMeasurement);
-  const finalizeMeasurement = useViewerStore((state) => state.finalizeMeasurement);
-  const cancelMeasurement = useViewerStore((state) => state.cancelMeasurement);
-  const setSnapTarget = useViewerStore((state) => state.setSnapTarget);
-  const setSnapVisualization = useViewerStore((state) => state.setSnapVisualization);
-  const snapEnabled = useViewerStore((state) => state.snapEnabled);
-  const updateMeasurementScreenCoords = useViewerStore((state) => state.updateMeasurementScreenCoords);
-  const measurements = useViewerStore((state) => state.measurements);
+  // Visibility state - use computedIsolatedIds from parent (includes storey selection)
+  // Fall back to store isolation if computedIsolatedIds is not provided
+  const { hiddenEntities, isolatedEntities: storeIsolatedEntities } = useVisibilityState();
+  const isolatedEntities = computedIsolatedIds ?? storeIsolatedEntities ?? null;
 
-  // Edge lock state for magnetic snapping
-  const edgeLockState = useViewerStore((state) => state.edgeLockState);
-  const setEdgeLock = useViewerStore((state) => state.setEdgeLock);
-  const updateEdgeLockPosition = useViewerStore((state) => state.updateEdgeLockPosition);
-  const clearEdgeLock = useViewerStore((state) => state.clearEdgeLock);
-  const incrementEdgeLockStrength = useViewerStore((state) => state.incrementEdgeLockStrength);
+  // Tool state
+  const { activeTool, sectionPlane } = useToolState();
 
-  // Color update subscriptions
-  const pendingColorUpdates = useViewerStore((state) => state.pendingColorUpdates);
-  const clearPendingColorUpdates = useViewerStore((state) => state.clearPendingColorUpdates);
+  // Camera state
+  const { updateCameraRotationRealtime, updateScaleRealtime, setCameraCallbacks } = useCameraState();
 
-  const ifcDataStore = useViewerStore((state) => state.ifcDataStore);
+  // Theme state
+  const { theme } = useThemeState();
+
+  // Hover state
+  const { hoverTooltipsEnabled, setHoverState, clearHover } = useHoverState();
+
+  // Context menu state
+  const { openContextMenu } = useContextMenuState();
+
+  // Measurement state
+  const {
+    measurements,
+    pendingMeasurePoint,
+    activeMeasurement,
+    addMeasurePoint,
+    completeMeasurement,
+    startMeasurement,
+    updateMeasurement,
+    finalizeMeasurement,
+    cancelMeasurement,
+    updateMeasurementScreenCoords,
+    snapEnabled,
+    setSnapTarget,
+    setSnapVisualization,
+    edgeLockState,
+    setEdgeLock,
+    updateEdgeLockPosition,
+    clearEdgeLock,
+    incrementEdgeLockStrength,
+  } = useMeasurementState();
+
+  // Color update state
+  const { pendingColorUpdates, clearPendingColorUpdates } = useColorUpdateState();
+
+  // IFC data state
+  const { ifcDataStore } = useIfcDataState();
 
   // Calculate section plane range based on storey heights only
   const sectionRange = useMemo(() => {
@@ -101,11 +127,7 @@ export function Viewport({ geometry, coordinateInfo, computedIsolatedIds }: View
 
   useEffect(() => {
     // Update clear color when theme changes
-    if (theme === 'light') {
-      clearColorRef.current = [0.96, 0.96, 0.97, 1]; // Light gray for light mode
-    } else {
-      clearColorRef.current = [0.102, 0.106, 0.149, 1]; // Tokyo Night storm (#1a1b26)
-    }
+    clearColorRef.current = getThemeClearColor(theme as 'light' | 'dark');
     // Re-render with new clear color
     const renderer = rendererRef.current;
     if (renderer && isInitialized) {
@@ -293,13 +315,13 @@ export function Viewport({ geometry, coordinateInfo, computedIsolatedIds }: View
 
       // Helper function to compute snap visualization (edge highlights, sliding dot, corner rings, plane indicators)
       // Stores 3D coordinates so edge highlights stay positioned correctly during camera rotation
-      function updateSnapVisualization(snapTarget: any, edgeLockInfo?: { edgeT: number; isCorner: boolean; cornerValence: number }) {
+      function updateSnapVisualization(snapTarget: SnapTarget | null, edgeLockInfo?: { edgeT: number; isCorner: boolean; cornerValence: number }) {
         if (!snapTarget || !canvas) {
           setSnapVisualization(null);
           return;
         }
 
-        const viz: any = {};
+        const viz: Partial<SnapVisualization> = {};
 
         // For edge snaps: store 3D world coordinates (will be projected to screen by ToolOverlays)
         if ((snapTarget.type === 'edge' || snapTarget.type === 'vertex') && snapTarget.metadata?.vertices) {
@@ -347,61 +369,7 @@ export function Viewport({ geometry, coordinateInfo, computedIsolatedIds }: View
         setSnapVisualization(viz);
       }
 
-      // Helper function to get entity bounds (min/max) - defined early for callbacks
-      function getEntityBounds(
-        geom: MeshData[] | null,
-        entityId: number
-      ): { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null {
-        if (!geom) {
-          console.warn('[Viewport] getEntityBounds: geometry is null');
-          return null;
-        }
-        const mesh = geom.find(m => m.expressId === entityId);
-        if (!mesh) {
-          console.warn(`[Viewport] getEntityBounds: mesh not found for entityId ${entityId}`);
-          return null;
-        }
-        if (mesh.positions.length < 3) {
-          console.warn(`[Viewport] getEntityBounds: mesh has insufficient positions for entityId ${entityId}`);
-          return null;
-        }
-
-        let minX = Infinity, minY = Infinity, minZ = Infinity;
-        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-        for (let i = 0; i < mesh.positions.length; i += 3) {
-          const x = mesh.positions[i];
-          const y = mesh.positions[i + 1];
-          const z = mesh.positions[i + 2];
-          minX = Math.min(minX, x);
-          minY = Math.min(minY, y);
-          minZ = Math.min(minZ, z);
-          maxX = Math.max(maxX, x);
-          maxY = Math.max(maxY, y);
-          maxZ = Math.max(maxZ, z);
-        }
-
-        return {
-          min: { x: minX, y: minY, z: minZ },
-          max: { x: maxX, y: maxY, z: maxZ },
-        };
-      }
-
-      // Helper function to get entity center from geometry (uses bounding box center)
-      function getEntityCenter(
-        geom: MeshData[] | null,
-        entityId: number
-      ): { x: number; y: number; z: number } | null {
-        const bounds = getEntityBounds(geom, entityId);
-        if (bounds) {
-          return {
-            x: (bounds.min.x + bounds.max.x) / 2,
-            y: (bounds.min.y + bounds.max.y) / 2,
-            z: (bounds.min.z + bounds.max.z) / 2,
-          };
-        }
-        return null;
-      }
+      // Note: getEntityBounds and getEntityCenter are now imported from viewportUtils.ts
 
       // Register camera callbacks for ViewCube and other controls
       setCameraCallbacks({
@@ -1594,11 +1562,6 @@ export function Viewport({ geometry, coordinateInfo, computedIsolatedIds }: View
             const boundsExpanded = newMaxSize > oldMaxSize * 1.1;
 
             if (boundsExpanded) {
-              console.log('[Viewport] Refitting camera after streaming complete - bounds expanded:', {
-                oldMaxSize: oldMaxSize.toFixed(1),
-                newMaxSize: newMaxSize.toFixed(1),
-                expansion: ((newMaxSize / oldMaxSize - 1) * 100).toFixed(0) + '%'
-              });
               renderer.getCamera().fitToBounds(shiftedBounds.min, shiftedBounds.max);
             }
           }
@@ -1815,9 +1778,6 @@ export function Viewport({ geometry, coordinateInfo, computedIsolatedIds }: View
       clearPendingColorUpdates();
     }
   }, [pendingColorUpdates, isInitialized, clearPendingColorUpdates]);
-
-  // Get selectedEntityIds from store for multi-selection
-  const selectedEntityIds = useViewerStore((state) => state.selectedEntityIds);
 
   // Re-render when visibility, selection, or section plane changes
   useEffect(() => {

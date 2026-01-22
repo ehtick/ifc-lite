@@ -9,6 +9,7 @@
 import type { Mesh, InstancedMesh, BatchedMesh, Vec3 } from './types.js';
 import type { MeshData } from '@ifc-lite/geometry';
 import { MathUtils } from './math.js';
+import type { RenderPipeline } from './pipeline.js';
 
 interface BoundingBox {
   min: Vec3;
@@ -191,7 +192,7 @@ export class Scene {
    * - Mesh data is accumulated immediately (fast)
    * - GPU buffers are rebuilt at most every batchRebuildThrottleMs (expensive)
    */
-  appendToBatches(meshDataArray: MeshData[], device: GPUDevice, pipeline: any, isStreaming: boolean = false): void {
+  appendToBatches(meshDataArray: MeshData[], device: GPUDevice, pipeline: RenderPipeline, isStreaming: boolean = false): void {
     // Track which color keys received new data in THIS call
     for (const meshData of meshDataArray) {
       const key = this.colorKey(meshData.color);
@@ -225,7 +226,7 @@ export class Scene {
   /**
    * Rebuild all pending batches (call this after streaming completes)
    */
-  rebuildPendingBatches(device: GPUDevice, pipeline: any): void {
+  rebuildPendingBatches(device: GPUDevice, pipeline: RenderPipeline): void {
     if (this.pendingBatchKeys.size === 0) return;
 
     for (const key of this.pendingBatchKeys) {
@@ -275,7 +276,7 @@ export class Scene {
   updateMeshColors(
     updates: Map<number, [number, number, number, number]>,
     device: GPUDevice,
-    pipeline: any
+    pipeline: RenderPipeline
   ): void {
     if (updates.size === 0) return;
 
@@ -361,7 +362,7 @@ export class Scene {
     meshDataArray: MeshData[],
     color: [number, number, number, number],
     device: GPUDevice,
-    pipeline: any
+    pipeline: RenderPipeline
   ): BatchedMesh {
     const merged = this.mergeGeometry(meshDataArray);
     const expressIds = meshDataArray.map(m => m.expressId);
@@ -485,7 +486,7 @@ export class Scene {
     colorKey: string,
     visibleIds: Set<number>,
     device: GPUDevice,
-    pipeline: any
+    pipeline: RenderPipeline
   ): BatchedMesh | undefined {
     // Create cache key from colorKey + deterministic hash of all visible IDs
     // Using a proper hash over all IDs to avoid collisions when middle IDs differ
@@ -612,16 +613,41 @@ export class Scene {
   }
 
   /**
-   * Calculate bounding box
+   * Calculate bounding box from actual mesh vertex data
    */
   getBounds(): { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null {
-    if (this.meshes.length === 0) return null;
+    if (this.meshDataMap.size === 0) return null;
 
-    // For MVP, return a simple bounding box
-    // In production, this would compute from actual vertex data
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    let hasValidData = false;
+
+    // Compute bounds from all mesh data
+    for (const pieces of this.meshDataMap.values()) {
+      for (const piece of pieces) {
+        const positions = piece.positions;
+        for (let i = 0; i < positions.length; i += 3) {
+          const x = positions[i];
+          const y = positions[i + 1];
+          const z = positions[i + 2];
+          if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+            hasValidData = true;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (z < minZ) minZ = z;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+            if (z > maxZ) maxZ = z;
+          }
+        }
+      }
+    }
+
+    if (!hasValidData) return null;
+
     return {
-      min: { x: -10, y: -10, z: -10 },
-      max: { x: 10, y: 10, z: 10 },
+      min: { x: minX, y: minY, z: minZ },
+      max: { x: maxX, y: maxY, z: maxZ },
     };
   }
 

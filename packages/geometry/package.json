@@ -13,7 +13,8 @@
   },
   "scripts": {
     "build": "tsc || true",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "@ifc-lite/wasm": "workspace:^"
@@ -23,6 +24,7 @@
   },
   "devDependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.3.0"
   },
   "license": "MPL-2.0",
