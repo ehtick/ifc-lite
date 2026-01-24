@@ -8,7 +8,7 @@
 
 use crate::profile::Profile2D;
 use crate::{Error, Point2, Point3, Result, Vector3};
-use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType, ProfileCategory};
+use ifc_lite_core::{AttributeValue, DecodedEntity, EntityDecoder, IfcSchema, IfcType, ProfileCategory};
 use std::f64::consts::PI;
 
 /// Profile processor - processes IFC profiles into 2D contours
@@ -1134,8 +1134,29 @@ impl ProfileProcessor {
 
         for segment in segments {
             // Each segment is either IFCLINEINDEX((i1,i2,...)) or IFCARCINDEX((i1,i2,i3))
-            // The segment itself contains a list of indices
-            if let Some(indices) = segment.as_list() {
+            // Typed values are stored as List([String("IFCLINEINDEX"), List([indices...])])
+            // So we need to extract the inner list (skip the type name)
+            let indices = if let Some(segment_list) = segment.as_list() {
+                // Check if this is a typed value: List([String(type_name), List([indices...])])
+                // Typed values like IFCLINEINDEX((1,2)) are stored as:
+                // List([String("IFCLINEINDEX"), List([Integer(1), Integer(2)])])
+                if segment_list.len() >= 2 {
+                    // First element is type name (String), second is the actual indices list
+                    if let Some(AttributeValue::List(indices_list)) = segment_list.get(1) {
+                        Some(indices_list.as_slice())
+                    } else {
+                        // Fallback: maybe it's a direct list of indices (not typed)
+                        Some(segment_list)
+                    }
+                } else {
+                    // Single element or empty - treat as direct list
+                    Some(segment_list)
+                }
+            } else {
+                None
+            };
+
+            if let Some(indices) = indices {
                 let idx_values: Vec<usize> = indices
                     .iter()
                     .filter_map(|v| v.as_float().map(|f| f as usize - 1)) // 1-indexed to 0-indexed
@@ -1182,6 +1203,7 @@ impl ProfileProcessor {
                     }
                 }
             }
+            // else: segment is not a list, skip it
         }
 
         Ok(result_points)

@@ -29,7 +29,8 @@ export interface CoordinateInfo {
     originShift: Vec3;
     originalBounds: AABB;
     shiftedBounds: AABB;
-    isGeoReferenced: boolean;
+    /** True if model had large coordinates requiring RTC shift. NOT the same as proper georeferencing via IfcMapConversion. */
+    hasLargeCoordinates: boolean;
 }
 
 export class CoordinateHandler {
@@ -43,6 +44,13 @@ export class CoordinateHandler {
     private accumulatedBounds: AABB | null = null;
     private shiftCalculated: boolean = false;
 
+    // WASM RTC detection - if WASM already applied RTC, skip TypeScript shift
+    private wasmRtcDetected: boolean = false;
+    // Threshold for "normal" coordinates when WASM RTC is active (10km = reasonable campus/site size)
+    private readonly NORMAL_COORD_THRESHOLD = 10000;
+    // Active threshold for coordinate validation (set based on wasmRtcDetected)
+    private activeThreshold: number = 1e7;
+
     /**
      * Check if a coordinate value is reasonable (not corrupted garbage)
      */
@@ -52,13 +60,16 @@ export class CoordinateHandler {
 
     /**
      * Calculate bounding box from all meshes (filtering out corrupted values)
+     * @param meshes - Meshes to calculate bounds from
+     * @param maxCoord - Optional max coordinate threshold (default: MAX_REASONABLE_COORD)
      */
-    calculateBounds(meshes: MeshData[]): AABB {
+    calculateBounds(meshes: MeshData[], maxCoord?: number): AABB {
         const bounds: AABB = {
             min: { x: Infinity, y: Infinity, z: Infinity },
             max: { x: -Infinity, y: -Infinity, z: -Infinity },
         };
 
+        const threshold = maxCoord ?? this.MAX_REASONABLE_COORD;
         let validVertexCount = 0;
         let corruptedVertexCount = 0;
 
@@ -69,8 +80,12 @@ export class CoordinateHandler {
                 const y = positions[i + 1];
                 const z = positions[i + 2];
 
-                // Only include reasonable values (filter out corrupted garbage)
-                if (this.isReasonableValue(x) && this.isReasonableValue(y) && this.isReasonableValue(z)) {
+                // Only include values within threshold (filter out outliers/garbage)
+                const coordsFinite = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
+                const withinThreshold = coordsFinite &&
+                    Math.abs(x) < threshold && Math.abs(y) < threshold && Math.abs(z) < threshold;
+
+                if (withinThreshold) {
                     bounds.min.x = Math.min(bounds.min.x, x);
                     bounds.min.y = Math.min(bounds.min.y, y);
                     bounds.min.z = Math.min(bounds.min.z, z);
@@ -118,20 +133,27 @@ export class CoordinateHandler {
     /**
      * Shift positions in-place by subtracting origin shift
      * Corrupted values are set to 0 (center of shifted coordinate system)
+     * @param positions - Position array to modify
+     * @param shift - Origin shift to subtract
+     * @param threshold - Optional threshold for valid coordinates (defaults to MAX_REASONABLE_COORD)
      */
-    shiftPositions(positions: Float32Array, shift: Vec3): void {
+    shiftPositions(positions: Float32Array, shift: Vec3, threshold?: number): void {
+        const maxCoord = threshold ?? this.MAX_REASONABLE_COORD;
         for (let i = 0; i < positions.length; i += 3) {
             const x = positions[i];
             const y = positions[i + 1];
             const z = positions[i + 2];
 
-            // For corrupted values, set to center (0) in shifted space
-            if (this.isReasonableValue(x) && this.isReasonableValue(y) && this.isReasonableValue(z)) {
+            // For corrupted/outlier values, set to center (0) in shifted space
+            const coordsValid = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) &&
+                Math.abs(x) < maxCoord && Math.abs(y) < maxCoord && Math.abs(z) < maxCoord;
+
+            if (coordsValid) {
                 positions[i] = x - shift.x;
                 positions[i + 1] = y - shift.y;
                 positions[i + 2] = z - shift.z;
             } else {
-                // Corrupted vertex - set to origin to avoid visual artifacts
+                // Corrupted/outlier vertex - set to origin to avoid visual artifacts
                 positions[i] = 0;
                 positions[i + 1] = 0;
                 positions[i + 2] = 0;
@@ -171,7 +193,7 @@ export class CoordinateHandler {
                 min: { x: 0, y: 0, z: 0 },
                 max: { x: 0, y: 0, z: 0 },
             },
-            isGeoReferenced: false,
+            hasLargeCoordinates: false,
         };
 
         if (meshes.length === 0) {
@@ -219,7 +241,7 @@ export class CoordinateHandler {
                 originShift: zeroShift,
                 originalBounds,
                 shiftedBounds: originalBounds,
-                isGeoReferenced: false,
+                hasLargeCoordinates: false,
             };
         }
 
@@ -254,7 +276,7 @@ export class CoordinateHandler {
             originShift: centroid,
             originalBounds,
             shiftedBounds,
-            isGeoReferenced: true,
+            hasLargeCoordinates: true,
         };
     }
 
@@ -290,10 +312,15 @@ export class CoordinateHandler {
     /**
      * Process meshes incrementally for streaming
      * Accumulates bounds and applies shift once calculated
+     *
+     * IMPORTANT: Detects if WASM already applied RTC offset by checking if
+     * majority of meshes have small coordinates. If so, skips TypeScript shift.
      */
     processMeshesIncremental(batch: MeshData[]): void {
-        // Accumulate bounds from this batch
-        const batchBounds = this.calculateBounds(batch);
+        // If WASM RTC was detected, use stricter threshold to exclude outliers
+        // Store in instance variable so shiftPositions uses the same threshold
+        this.activeThreshold = this.wasmRtcDetected ? this.NORMAL_COORD_THRESHOLD : this.MAX_REASONABLE_COORD;
+        const batchBounds = this.calculateBounds(batch, this.activeThreshold);
 
         if (this.accumulatedBounds === null) {
             this.accumulatedBounds = batchBounds;
@@ -325,23 +352,63 @@ export class CoordinateHandler {
                     centroid.x ** 2 + centroid.y ** 2 + centroid.z ** 2
                 );
 
-                // Check if shift is needed (>10km from origin)
-                if (distanceFromOrigin > this.THRESHOLD || maxSize > this.THRESHOLD) {
+                // DETECT IF WASM ALREADY APPLIED RTC
+                // If majority of meshes have small coordinates, WASM already shifted them
+                let smallCoordCount = 0;
+                let largeCoordCount = 0;
+                const SMALL_COORD_THRESHOLD = 10000; // 10km - reasonable campus/site size
+
+                for (const mesh of batch) {
+                    const positions = mesh.positions;
+                    if (positions.length >= 3) {
+                        // Check first vertex of each mesh
+                        const x = Math.abs(positions[0]);
+                        const y = Math.abs(positions[1]);
+                        const z = Math.abs(positions[2]);
+                        const maxCoord = Math.max(x, y, z);
+                        if (maxCoord < SMALL_COORD_THRESHOLD) {
+                            smallCoordCount++;
+                        } else {
+                            largeCoordCount++;
+                        }
+                    }
+                }
+
+                // If >50% have small coords, WASM RTC was likely applied
+                const totalMeshes = smallCoordCount + largeCoordCount;
+                const wasmRtcLikelyApplied = totalMeshes > 0 && (smallCoordCount / totalMeshes) > 0.5;
+
+                if (wasmRtcLikelyApplied) {
+                    this.wasmRtcDetected = true;
+                    // Recalculate bounds excluding outliers (use stricter threshold)
+                    this.accumulatedBounds = this.calculateBounds(batch, this.NORMAL_COORD_THRESHOLD);
+                }
+
+                // Check if shift is needed (>10km from origin) AND WASM didn't already apply RTC
+                if ((distanceFromOrigin > this.THRESHOLD || maxSize > this.THRESHOLD) && !wasmRtcLikelyApplied) {
                     this.originShift = centroid;
                     console.log('[CoordinateHandler] Large coordinates detected, shifting to origin:', {
                         distanceFromOrigin: distanceFromOrigin.toFixed(2) + 'm',
                         maxSize: maxSize.toFixed(2) + 'm',
                         shift: this.originShift,
                     });
+                } else if (wasmRtcLikelyApplied) {
+                    // Log that we're skipping because WASM already applied RTC
+                    console.log('[CoordinateHandler] Skipping shift - WASM RTC already applied:', {
+                        smallCoordCount,
+                        largeCoordCount,
+                        wasmRtcDetected: true,
+                    });
                 }
             }
             this.shiftCalculated = true;
         }
 
-        // Apply shift to this batch
+        // Apply shift to this batch (only if we determined shift is needed AND WASM didn't already apply)
+        // Use the same threshold for vertex cleanup as was used for bounds calculation
         if (this.originShift.x !== 0 || this.originShift.y !== 0 || this.originShift.z !== 0) {
             for (const mesh of batch) {
-                this.shiftPositions(mesh.positions, this.originShift);
+                this.shiftPositions(mesh.positions, this.originShift, this.activeThreshold);
             }
         }
     }
@@ -363,7 +430,7 @@ export class CoordinateHandler {
         }
 
         const shiftedBounds = this.shiftBounds(this.accumulatedBounds, this.originShift);
-        const isGeoReferenced =
+        const hasLargeCoordinates =
             this.originShift.x !== 0 ||
             this.originShift.y !== 0 ||
             this.originShift.z !== 0;
@@ -372,7 +439,7 @@ export class CoordinateHandler {
             originShift: { ...this.originShift },
             originalBounds: { ...this.accumulatedBounds },
             shiftedBounds,
-            isGeoReferenced,
+            hasLargeCoordinates,
         };
     }
 
@@ -396,7 +463,7 @@ export class CoordinateHandler {
                 min: { x: 0, y: 0, z: 0 },
                 max: { x: 0, y: 0, z: 0 },
             },
-            isGeoReferenced: false,
+            hasLargeCoordinates: false,
         };
     }
 
@@ -407,5 +474,7 @@ export class CoordinateHandler {
         this.accumulatedBounds = null;
         this.shiftCalculated = false;
         this.originShift = { x: 0, y: 0, z: 0 };
+        this.wasmRtcDetected = false;
+        this.activeThreshold = this.MAX_REASONABLE_COORD;
     }
 }

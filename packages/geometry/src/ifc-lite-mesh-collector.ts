@@ -67,6 +67,30 @@ export class IfcLiteMeshCollector {
   }
 
   /**
+   * Reverse triangle winding order to correct for handedness flip.
+   * The Z-up to Y-up conversion includes a reflection (Z negation),
+   * which flips the handedness. This reverses winding to compensate,
+   * ensuring triangles face the correct direction after transformation.
+   */
+  private reverseWindingOrder(indices: Uint32Array): void {
+    // Calculate last valid triangle index to avoid out-of-bounds access
+    const remainder = indices.length % 3;
+    const end = indices.length - remainder;
+
+    // Warn if indices array has trailing non-triangle entries
+    if (remainder !== 0) {
+      console.warn(`[reverseWindingOrder] Index buffer has ${remainder} trailing entries (not divisible by 3)`);
+    }
+
+    for (let i = 0; i < end; i += 3) {
+      // Swap second and third vertex of each triangle
+      const temp = indices[i + 1];
+      indices[i + 1] = indices[i + 2];
+      indices[i + 2] = temp;
+    }
+  }
+
+  /**
    * Collect all meshes from IFC-Lite
    * Much faster than web-ifc (~1.9x speedup)
    */
@@ -109,6 +133,10 @@ export class IfcLiteMeshCollector {
         // Convert IFC Z-up to WebGL Y-up (modify captured arrays)
         this.convertZUpToYUp(positions);
         this.convertZUpToYUp(normals);
+
+        // Reverse winding order to compensate for handedness flip from Y negation
+        // Without this, triangles face the wrong way and get backface-culled
+        this.reverseWindingOrder(indices);
 
         meshes.push({
           expressId: mesh.expressId,
@@ -206,6 +234,9 @@ export class IfcLiteMeshCollector {
             // Convert IFC Z-up to WebGL Y-up
             this.convertZUpToYUp(positions);
             this.convertZUpToYUp(normals);
+
+            // Reverse winding order to compensate for handedness flip from Y negation
+            this.reverseWindingOrder(indices);
 
             convertedBatch.push({
               expressId,

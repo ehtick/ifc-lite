@@ -92,6 +92,10 @@ pub struct GeometryRouter {
     /// Unit scale factor (e.g., 0.001 for millimeters -> meters)
     /// Applied to all mesh positions after processing
     unit_scale: f64,
+    /// RTC (Relative-to-Center) offset for handling large coordinates
+    /// Subtracted from all world positions in f64 before converting to f32
+    /// This preserves precision for georeferenced models (e.g., Swiss UTM)
+    rtc_offset: (f64, f64, f64),
 }
 
 impl GeometryRouter {
@@ -106,6 +110,7 @@ impl GeometryRouter {
             faceted_brep_cache: RefCell::new(FxHashMap::default()),
             geometry_hash_cache: RefCell::new(FxHashMap::default()),
             unit_scale: 1.0, // Default to base meters
+            rtc_offset: (0.0, 0.0, 0.0), // Default to no offset
         };
 
         // Register default P0 processors
@@ -144,6 +149,34 @@ impl GeometryRouter {
         Self::with_scale(scale)
     }
 
+    /// Create router with unit scale extracted from IFC file AND RTC offset for large coordinates
+    /// This is the recommended method for georeferenced models (Swiss UTM, etc.)
+    ///
+    /// # Arguments
+    /// * `content` - IFC file content
+    /// * `decoder` - Entity decoder
+    /// * `rtc_offset` - RTC offset to subtract from world coordinates (typically model centroid)
+    pub fn with_units_and_rtc(
+        content: &str,
+        decoder: &mut ifc_lite_core::EntityDecoder,
+        rtc_offset: (f64, f64, f64),
+    ) -> Self {
+        let mut scanner = ifc_lite_core::EntityScanner::new(content);
+        let mut scale = 1.0;
+
+        // Scan through file to find IFCPROJECT
+        while let Some((id, type_name, _, _)) = scanner.next_entity() {
+            if type_name == "IFCPROJECT" {
+                if let Ok(s) = ifc_lite_core::extract_length_unit_scale(decoder, id) {
+                    scale = s;
+                }
+                break;
+            }
+        }
+
+        Self::with_scale_and_rtc(scale, rtc_offset)
+    }
+
     /// Create router with pre-calculated unit scale
     pub fn with_scale(unit_scale: f64) -> Self {
         let mut router = Self::new();
@@ -151,9 +184,131 @@ impl GeometryRouter {
         router
     }
 
+    /// Create router with RTC offset for large coordinate handling
+    /// Use this for georeferenced models (e.g., Swiss UTM coordinates)
+    pub fn with_rtc(rtc_offset: (f64, f64, f64)) -> Self {
+        let mut router = Self::new();
+        router.rtc_offset = rtc_offset;
+        router
+    }
+
+    /// Create router with both unit scale and RTC offset
+    pub fn with_scale_and_rtc(unit_scale: f64, rtc_offset: (f64, f64, f64)) -> Self {
+        let mut router = Self::new();
+        router.unit_scale = unit_scale;
+        router.rtc_offset = rtc_offset;
+        router
+    }
+
+    /// Set the RTC offset for large coordinate handling
+    pub fn set_rtc_offset(&mut self, offset: (f64, f64, f64)) {
+        self.rtc_offset = offset;
+    }
+
+    /// Get the current RTC offset
+    pub fn rtc_offset(&self) -> (f64, f64, f64) {
+        self.rtc_offset
+    }
+
+    /// Check if RTC offset is active (non-zero)
+    #[inline]
+    pub fn has_rtc_offset(&self) -> bool {
+        self.rtc_offset.0 != 0.0 || self.rtc_offset.1 != 0.0 || self.rtc_offset.2 != 0.0
+    }
+
     /// Get the current unit scale factor
     pub fn unit_scale(&self) -> f64 {
         self.unit_scale
+    }
+
+    /// Detect RTC offset by sampling multiple building elements and computing centroid
+    /// This handles federated models where different elements may be in different world locations
+    /// Returns the centroid of sampled element positions if coordinates are large (>10km)
+    pub fn detect_rtc_offset_from_first_element(
+        &self,
+        content: &str,
+        decoder: &mut EntityDecoder,
+    ) -> (f64, f64, f64) {
+        use ifc_lite_core::EntityScanner;
+
+        let mut scanner = EntityScanner::new(content);
+
+        // Collect translations from multiple elements to compute centroid
+        let mut translations: Vec<(f64, f64, f64)> = Vec::new();
+        const MAX_SAMPLES: usize = 50; // Sample up to 50 elements for centroid calculation
+
+        // List of actual building element types that have placements
+        const BUILDING_ELEMENT_TYPES: &[&str] = &[
+            "IFCWALL", "IFCWALLSTANDARDCASE", "IFCSLAB", "IFCBEAM", "IFCCOLUMN",
+            "IFCPLATE", "IFCROOF", "IFCCOVERING", "IFCFOOTING", "IFCRAILING",
+            "IFCSTAIR", "IFCSTAIRFLIGHT", "IFCRAMP", "IFCRAMPFLIGHT",
+            "IFCDOOR", "IFCWINDOW", "IFCFURNISHINGELEMENT", "IFCBUILDINGELEMENTPROXY",
+            "IFCMEMBER", "IFCCURTAINWALL", "IFCPILE", "IFCSHADINGDEVICE",
+        ];
+
+        // Sample building elements to collect their world positions
+        while let Some((_id, type_name, start, end)) = scanner.next_entity() {
+            if translations.len() >= MAX_SAMPLES {
+                break;
+            }
+
+            // Check if this is an actual building element type
+            if !BUILDING_ELEMENT_TYPES.iter().any(|&t| t == type_name) {
+                continue;
+            }
+
+            // Decode the element
+            if let Ok(entity) = decoder.decode_at(start, end) {
+                // Check if it has representation
+                let has_rep = entity.get(6).map(|a| !a.is_null()).unwrap_or(false);
+                if !has_rep {
+                    continue;
+                }
+
+                // Get placement transform - this contains the world offset
+                // CRITICAL: Apply unit scaling BEFORE reading translation, same as transform_mesh does
+                if let Ok(mut transform) = self.get_placement_transform_from_element(&entity, decoder) {
+                    self.scale_transform(&mut transform);
+                    let tx = transform[(0, 3)];
+                    let ty = transform[(1, 3)];
+                    let tz = transform[(2, 3)];
+
+                    // Only collect if coordinates are valid
+                    if tx.is_finite() && ty.is_finite() && tz.is_finite() {
+                        translations.push((tx, ty, tz));
+                    }
+                }
+            }
+        }
+
+        if translations.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+
+        // Compute median-based centroid for robustness against outliers
+        // Sort each coordinate dimension separately and take median
+        let mut x_coords: Vec<f64> = translations.iter().map(|(x, _, _)| *x).collect();
+        let mut y_coords: Vec<f64> = translations.iter().map(|(_, y, _)| *y).collect();
+        let mut z_coords: Vec<f64> = translations.iter().map(|(_, _, z)| *z).collect();
+
+        x_coords.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        y_coords.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        z_coords.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let median_idx = x_coords.len() / 2;
+        let centroid = (
+            x_coords[median_idx],
+            y_coords[median_idx],
+            z_coords[median_idx],
+        );
+
+        // Check if centroid is large (>10km from origin)
+        const THRESHOLD: f64 = 10000.0;
+        if centroid.0.abs() > THRESHOLD || centroid.1.abs() > THRESHOLD || centroid.2.abs() > THRESHOLD {
+            return centroid;
+        }
+
+        (0.0, 0.0, 0.0)
     }
 
     /// Scale mesh positions from file units to meters
@@ -738,38 +893,37 @@ impl GeometryRouter {
             }
         };
 
-        // STEP 2: Get element's ObjectPlacement transform (for clipping planes)
-        let mut object_placement_transform = match self.get_placement_transform_from_element(element, decoder) {
-            Ok(t) => t,
-            Err(_) => Matrix4::identity(),
-        };
-        self.scale_transform(&mut object_placement_transform);
-        
-        // STEP 3: Extract clipping planes (for roof clips)
-        let (_local_profile, _depth, _axis, _origin, _position_transform, clipping_planes) = 
-            match self.extract_base_profile_and_clips(element, decoder) {
-                Ok(result) => result,
-                Err(_) => {
-                    use crate::profile::Profile2D;
-                    use nalgebra::Point2;
-                    let fallback_profile = Profile2D::new(vec![Point2::new(0.0, 0.0)]);
-                    (fallback_profile, 0.0, 0, 0.0, None, Vec::new())
-                }
-            };
-        
-        // STEP 4: Transform clipping planes to world coordinates
+        // OPTIMIZATION: Only extract clipping planes if element actually has them
+        // This skips expensive profile extraction for ~95% of elements
         use nalgebra::Vector3;
-        let world_clipping_planes: Vec<(Point3<f64>, Vector3<f64>, bool)> = clipping_planes
-            .iter()
-            .map(|(point, normal, agreement)| {
-                // Transform point by ObjectPlacement
-                let world_point = object_placement_transform.transform_point(point);
-                // Transform normal (rotation only, no translation)
-                let rotation = object_placement_transform.fixed_view::<3, 3>(0, 0);
-                let world_normal = (rotation * normal).normalize();
-                (world_point, world_normal, *agreement)
-            })
-            .collect();
+        let world_clipping_planes: Vec<(Point3<f64>, Vector3<f64>, bool)> =
+            if self.has_clipping_planes(element, decoder) {
+                // Get element's ObjectPlacement transform (for clipping planes)
+                let mut object_placement_transform = match self.get_placement_transform_from_element(element, decoder) {
+                    Ok(t) => t,
+                    Err(_) => Matrix4::identity(),
+                };
+                self.scale_transform(&mut object_placement_transform);
+
+                // Extract clipping planes (for roof clips)
+                let clipping_planes = match self.extract_base_profile_and_clips(element, decoder) {
+                    Ok((_profile, _depth, _axis, _origin, _transform, clips)) => clips,
+                    Err(_) => Vec::new(),
+                };
+
+                // Transform clipping planes to world coordinates
+                clipping_planes
+                    .iter()
+                    .map(|(point, normal, agreement)| {
+                        let world_point = object_placement_transform.transform_point(point);
+                        let rotation = object_placement_transform.fixed_view::<3, 3>(0, 0);
+                        let world_normal = (rotation * normal).normalize();
+                        (world_point, world_normal, *agreement)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         
         // STEP 5: Collect opening info (bounds for rectangular, full mesh for non-rectangular)
         // For rectangular openings, get individual bounds per representation item to handle
@@ -1385,6 +1539,63 @@ impl GeometryRouter {
         mesh.add_vertex(*v3, *normal);
         mesh.add_triangle(base, base + 1, base + 2);
         mesh.add_triangle(base, base + 2, base + 3);
+    }
+
+    /// Quick check if an element has clipping planes (IfcBooleanClippingResult in representation)
+    /// This is much faster than extract_base_profile_and_clips and allows skipping expensive
+    /// extraction for the ~95% of elements that don't have clipping.
+    #[inline]
+    fn has_clipping_planes(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> bool {
+        // Get representation
+        let representation_attr = match element.get(6) {
+            Some(attr) => attr,
+            None => return false,
+        };
+
+        let representation = match decoder.resolve_ref(representation_attr) {
+            Ok(Some(r)) if r.ifc_type == IfcType::IfcProductDefinitionShape => r,
+            _ => return false,
+        };
+
+        // Get representations list
+        let representations_attr = match representation.get(2) {
+            Some(attr) => attr,
+            None => return false,
+        };
+
+        let representations = match decoder.resolve_ref_list(representations_attr) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+
+        // Check if any representation item is IfcBooleanClippingResult
+        for shape_rep in &representations {
+            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
+                continue;
+            }
+
+            let items_attr = match shape_rep.get(3) {
+                Some(attr) => attr,
+                None => continue,
+            };
+
+            let items = match decoder.resolve_ref_list(items_attr) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            for item in &items {
+                if item.ifc_type == IfcType::IfcBooleanClippingResult {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Extract base wall profile, depth, axis info, Position transform, and clipping planes
@@ -2010,9 +2221,9 @@ impl GeometryRouter {
             }
         };
 
-        // Apply extrusion position transform
+        // Apply extrusion position transform (with RTC offset)
         if position_transform != Matrix4::identity() {
-            crate::extrusion::apply_transform(&mut mesh, &position_transform);
+            self.transform_mesh(&mut mesh, &position_transform);
         }
 
         // Scale mesh
@@ -2498,7 +2709,7 @@ impl GeometryRouter {
     ) -> Result<()> {
         let placement_attr = match element.get(5) {
             Some(attr) if !attr.is_null() => attr,
-            _ => return Ok(()), // No placement
+            _ => return Ok(()),
         };
 
         let placement = match decoder.resolve_ref(placement_attr)? {
@@ -2805,25 +3016,49 @@ impl GeometryRouter {
     }
 
     /// Transform mesh by matrix - optimized with chunk-based iteration
+    /// Applies transformation with uniform RTC offset decision for the whole mesh.
+    /// Determines once whether RTC is needed (based on transform translation) and applies uniformly.
     #[inline]
     fn transform_mesh(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
-        // Use chunks for better cache locality and less indexing overhead
-        mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
-            let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-            let transformed = transform.transform_point(&point);
-            chunk[0] = transformed.x as f32;
-            chunk[1] = transformed.y as f32;
-            chunk[2] = transformed.z as f32;
-        });
+        let rtc = self.rtc_offset;
+        const LARGE_COORD_THRESHOLD: f64 = 1000.0;
 
-        // Transform normals (without translation) - optimized chunk iteration
+        // Determine RTC need ONCE for the whole mesh based on transform's translation component
+        // This ensures all vertices in the mesh use consistent RTC subtraction
+        let tx = transform[(0, 3)];
+        let ty = transform[(1, 3)];
+        let tz = transform[(2, 3)];
+        let needs_rtc = self.has_rtc_offset() &&
+            (tx.abs() > LARGE_COORD_THRESHOLD || ty.abs() > LARGE_COORD_THRESHOLD || tz.abs() > LARGE_COORD_THRESHOLD);
+
+        if needs_rtc {
+            // Apply RTC offset to all vertices uniformly
+            mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
+                let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                let t = transform.transform_point(&point);
+                chunk[0] = (t.x - rtc.0) as f32;
+                chunk[1] = (t.y - rtc.1) as f32;
+                chunk[2] = (t.z - rtc.2) as f32;
+            });
+        } else {
+            // No RTC offset - just transform
+            mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
+                let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                let t = transform.transform_point(&point);
+                chunk[0] = t.x as f32;
+                chunk[1] = t.y as f32;
+                chunk[2] = t.z as f32;
+            });
+        }
+
+        // Transform normals (without translation)
         let rotation = transform.fixed_view::<3, 3>(0, 0);
         mesh.normals.chunks_exact_mut(3).for_each(|chunk| {
             let normal = Vector3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-            let transformed = (rotation * normal).normalize();
-            chunk[0] = transformed.x as f32;
-            chunk[1] = transformed.y as f32;
-            chunk[2] = transformed.z as f32;
+            let t = (rotation * normal).normalize();
+            chunk[0] = t.x as f32;
+            chunk[1] = t.y as f32;
+            chunk[2] = t.z as f32;
         });
     }
 

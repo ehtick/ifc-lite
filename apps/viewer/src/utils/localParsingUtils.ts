@@ -30,7 +30,8 @@ export interface CoordinateInfo {
   originShift: { x: number; y: number; z: number };
   originalBounds: Bounds3D;
   shiftedBounds: Bounds3D;
-  isGeoReferenced: boolean;
+  /** True if model had large coordinates requiring RTC shift. NOT the same as proper georeferencing via IfcMapConversion. */
+  hasLargeCoordinates: boolean;
 }
 
 /**
@@ -44,6 +45,13 @@ export interface GeometryStats {
 // ============================================================================
 // Bounds Calculation
 // ============================================================================
+
+/**
+ * Maximum coordinate threshold for valid geometry (10km)
+ * Matches CoordinateHandler's NORMAL_COORD_THRESHOLD
+ * Coordinates beyond this are likely corrupted or unshifted original coordinates
+ */
+export const MAX_VALID_COORD = 10000;
 
 /**
  * Create an initial bounds object with infinite values
@@ -62,13 +70,21 @@ export function createEmptyBounds(): Bounds3D {
  *
  * @param bounds - Bounds object to update (mutated)
  * @param positions - Float32Array of vertex positions (x,y,z triplets)
+ * @param maxCoord - Maximum valid coordinate value (default: 10km)
  */
-export function updateBoundsFromPositions(bounds: Bounds3D, positions: Float32Array | number[]): void {
+export function updateBoundsFromPositions(
+  bounds: Bounds3D,
+  positions: Float32Array | number[],
+  maxCoord: number = MAX_VALID_COORD
+): void {
   for (let i = 0; i < positions.length; i += 3) {
     const x = positions[i];
     const y = positions[i + 1];
     const z = positions[i + 2];
-    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+    // Filter out corrupted/unshifted vertices (> threshold from origin)
+    const isValid = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) &&
+      Math.abs(x) < maxCoord && Math.abs(y) < maxCoord && Math.abs(z) < maxCoord;
+    if (isValid) {
       bounds.min.x = Math.min(bounds.min.x, x);
       bounds.min.y = Math.min(bounds.min.y, y);
       bounds.min.z = Math.min(bounds.min.z, z);
@@ -107,13 +123,13 @@ export function calculateMeshBounds(meshes: MeshData[]): { bounds: Bounds3D; sta
  *
  * @param bounds - Calculated geometry bounds
  * @param originShift - Optional origin shift (defaults to zero)
- * @param isGeoReferenced - Whether the model is geo-referenced
+ * @param hasLargeCoordinates - Whether model had large coordinates requiring RTC shift
  * @returns Coordinate info object with cloned bounds and computed shiftedBounds
  */
 export function createCoordinateInfo(
   bounds: Bounds3D,
   originShift: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 },
-  isGeoReferenced: boolean = false
+  hasLargeCoordinates: boolean = false
 ): CoordinateInfo {
   // Deep-clone the incoming bounds into originalBounds
   const originalBounds: Bounds3D = {
@@ -139,7 +155,7 @@ export function createCoordinateInfo(
     originShift: { x: originShift.x, y: originShift.y, z: originShift.z },
     originalBounds,
     shiftedBounds,
-    isGeoReferenced,
+    hasLargeCoordinates,
   };
 }
 

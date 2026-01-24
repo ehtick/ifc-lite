@@ -55,6 +55,10 @@ export class GpuGeometry {
   free(): void;
   [Symbol.dispose](): void;
   /**
+   * Set the RTC (Relative To Center) offset applied to coordinates
+   */
+  set_rtc_offset(x: number, y: number, z: number): void;
+  /**
    * Get IFC type name by index
    */
   getIfcTypeName(index: number): string | undefined;
@@ -78,6 +82,22 @@ export class GpuGeometry {
    * Get pointer to indices array for zero-copy view
    */
   readonly indicesPtr: number;
+  /**
+   * Get X component of RTC offset
+   */
+  readonly rtcOffsetX: number;
+  /**
+   * Get Y component of RTC offset
+   */
+  readonly rtcOffsetY: number;
+  /**
+   * Get Z component of RTC offset
+   */
+  readonly rtcOffsetZ: number;
+  /**
+   * Check if RTC offset is active (non-zero)
+   */
+  readonly hasRtcOffset: boolean;
   /**
    * Get length of vertex data array (in f32 elements, not bytes)
    */
@@ -256,13 +276,25 @@ export class IfcAPI {
    * Parse IFC file with streaming mesh batches for progressive rendering
    * Calls the callback with batches of meshes, yielding to browser between batches
    *
+   * Options:
+   * - `batchSize`: Number of meshes per batch (default: 25)
+   * - `onBatch(meshes, progress)`: Called for each batch of meshes
+   * - `onRtcOffset({x, y, z, hasRtc})`: Called early with RTC offset for camera/world setup
+   * - `onColorUpdate(Map<id, color>)`: Called with style updates after initial render
+   * - `onComplete(stats)`: Called when parsing completes with stats including rtcOffset
+   *
    * Example:
    * ```javascript
    * const api = new IfcAPI();
    * await api.parseMeshesAsync(ifcData, {
    *   batchSize: 100,
+   *   onRtcOffset: (rtc) => {
+   *     if (rtc.hasRtc) {
+   *       // Model uses large coordinates - adjust camera/world origin
+   *       viewer.setWorldOffset(rtc.x, rtc.y, rtc.z);
+   *     }
+   *   },
    *   onBatch: (meshes, progress) => {
-   *     // Add meshes to scene
    *     for (const mesh of meshes) {
    *       scene.add(createThreeMesh(mesh));
    *     }
@@ -270,6 +302,7 @@ export class IfcAPI {
    *   },
    *   onComplete: (stats) => {
    *     console.log(`Done! ${stats.totalMeshes} meshes`);
+   *     // stats.rtcOffset also available here: {x, y, z, hasRtc}
    *   }
    * });
    * ```
@@ -496,9 +529,31 @@ export class MeshCollection {
   free(): void;
   [Symbol.dispose](): void;
   /**
+   * Check if RTC offset is significant (>10km)
+   */
+  hasRtcOffset(): boolean;
+  /**
+   * Convert local coordinates to world coordinates
+   * Use this to convert mesh positions back to original IFC coordinates
+   */
+  localToWorld(x: number, y: number, z: number): Float64Array;
+  /**
    * Get mesh at index
    */
   get(index: number): MeshDataJs | undefined;
+  /**
+   * Get RTC offset X (for converting local coords back to world coords)
+   * Add this to local X coordinates to get world X coordinates
+   */
+  readonly rtcOffsetX: number;
+  /**
+   * Get RTC offset Y
+   */
+  readonly rtcOffsetY: number;
+  /**
+   * Get RTC offset Z
+   */
+  readonly rtcOffsetZ: number;
   /**
    * Get total vertex count across all meshes
    */
@@ -719,12 +774,17 @@ export interface InitOutput {
   readonly georeferencejs_toMatrix: (a: number, b: number) => void;
   readonly gpugeometry_getIfcTypeName: (a: number, b: number, c: number) => void;
   readonly gpugeometry_getMeshMetadata: (a: number, b: number) => number;
+  readonly gpugeometry_hasRtcOffset: (a: number) => number;
   readonly gpugeometry_indicesByteLength: (a: number) => number;
   readonly gpugeometry_indicesLen: (a: number) => number;
   readonly gpugeometry_indicesPtr: (a: number) => number;
   readonly gpugeometry_isEmpty: (a: number) => number;
   readonly gpugeometry_meshCount: (a: number) => number;
   readonly gpugeometry_new: () => number;
+  readonly gpugeometry_rtcOffsetX: (a: number) => number;
+  readonly gpugeometry_rtcOffsetY: (a: number) => number;
+  readonly gpugeometry_rtcOffsetZ: (a: number) => number;
+  readonly gpugeometry_set_rtc_offset: (a: number, b: number, c: number, d: number) => void;
   readonly gpugeometry_totalTriangleCount: (a: number) => number;
   readonly gpugeometry_totalVertexCount: (a: number) => number;
   readonly gpugeometry_vertexDataByteLength: (a: number) => number;
@@ -744,6 +804,7 @@ export interface InitOutput {
   readonly gpuinstancedgeometry_vertexCount: (a: number) => number;
   readonly gpuinstancedgeometry_vertexDataByteLength: (a: number) => number;
   readonly gpuinstancedgeometry_vertexDataLen: (a: number) => number;
+  readonly gpuinstancedgeometry_vertexDataPtr: (a: number) => number;
   readonly gpuinstancedgeometrycollection_get: (a: number, b: number) => number;
   readonly gpuinstancedgeometrycollection_getRef: (a: number, b: number) => number;
   readonly gpuinstancedgeometrycollection_length: (a: number) => number;
@@ -798,7 +859,9 @@ export interface InitOutput {
   readonly instancedmeshcollection_get: (a: number, b: number) => number;
   readonly instancedmeshcollection_totalInstances: (a: number) => number;
   readonly meshcollection_get: (a: number, b: number) => number;
+  readonly meshcollection_hasRtcOffset: (a: number) => number;
   readonly meshcollection_length: (a: number) => number;
+  readonly meshcollection_localToWorld: (a: number, b: number, c: number, d: number, e: number) => void;
   readonly meshcollection_totalTriangles: (a: number) => number;
   readonly meshcollection_totalVertices: (a: number) => number;
   readonly meshcollectionwithrtc_get: (a: number, b: number) => number;
@@ -812,43 +875,45 @@ export interface InitOutput {
   readonly meshdatajs_normals: (a: number) => number;
   readonly meshdatajs_positions: (a: number) => number;
   readonly meshdatajs_triangleCount: (a: number) => number;
-  readonly rtcoffsetjs_isSignificant: (a: number) => number;
+  readonly meshdatajs_vertexCount: (a: number) => number;
   readonly rtcoffsetjs_toWorld: (a: number, b: number, c: number, d: number, e: number) => void;
   readonly version: (a: number) => void;
   readonly zerocopymesh_bounds_max: (a: number, b: number) => void;
   readonly zerocopymesh_bounds_min: (a: number, b: number) => void;
+  readonly zerocopymesh_is_empty: (a: number) => number;
   readonly zerocopymesh_new: () => number;
+  readonly zerocopymesh_normals_len: (a: number) => number;
+  readonly zerocopymesh_positions_len: (a: number) => number;
+  readonly zerocopymesh_positions_ptr: (a: number) => number;
   readonly zerocopymesh_vertex_count: (a: number) => number;
   readonly init: () => void;
   readonly instancedmeshcollection_length: (a: number) => number;
   readonly instancedmeshcollection_totalGeometries: (a: number) => number;
   readonly zerocopymesh_indices_len: (a: number) => number;
-  readonly zerocopymesh_normals_len: (a: number) => number;
-  readonly zerocopymesh_positions_len: (a: number) => number;
   readonly __wbg_set_rtcoffsetjs_x: (a: number, b: number) => void;
   readonly __wbg_set_rtcoffsetjs_y: (a: number, b: number) => void;
   readonly __wbg_set_rtcoffsetjs_z: (a: number, b: number) => void;
-  readonly meshdatajs_vertexCount: (a: number) => number;
   readonly zerocopymesh_triangle_count: (a: number) => number;
   readonly get_memory: () => number;
-  readonly gpuinstancedgeometry_vertexDataPtr: (a: number) => number;
   readonly zerocopymesh_indices_ptr: (a: number) => number;
   readonly zerocopymesh_normals_ptr: (a: number) => number;
-  readonly zerocopymesh_positions_ptr: (a: number) => number;
-  readonly zerocopymesh_is_empty: (a: number) => number;
+  readonly rtcoffsetjs_isSignificant: (a: number) => number;
   readonly __wbg_get_rtcoffsetjs_x: (a: number) => number;
   readonly __wbg_get_rtcoffsetjs_y: (a: number) => number;
   readonly __wbg_get_rtcoffsetjs_z: (a: number) => number;
   readonly instancedgeometry_geometryId: (a: number) => bigint;
-  readonly __wasm_bindgen_func_elem_399: (a: number, b: number) => void;
-  readonly __wasm_bindgen_func_elem_395: (a: number, b: number) => void;
-  readonly __wasm_bindgen_func_elem_782: (a: number, b: number, c: number) => void;
-  readonly __wasm_bindgen_func_elem_777: (a: number, b: number) => void;
-  readonly __wasm_bindgen_func_elem_813: (a: number, b: number, c: number, d: number) => void;
-  readonly __wbindgen_export: (a: number, b: number) => number;
-  readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
-  readonly __wbindgen_export3: (a: number) => void;
-  readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
+  readonly meshcollection_rtcOffsetX: (a: number) => number;
+  readonly meshcollection_rtcOffsetY: (a: number) => number;
+  readonly meshcollection_rtcOffsetZ: (a: number) => number;
+  readonly __wasm_bindgen_func_elem_912: (a: number, b: number, c: number) => void;
+  readonly __wasm_bindgen_func_elem_907: (a: number, b: number) => void;
+  readonly __wasm_bindgen_func_elem_408: (a: number, b: number) => void;
+  readonly __wasm_bindgen_func_elem_404: (a: number, b: number) => void;
+  readonly __wasm_bindgen_func_elem_943: (a: number, b: number, c: number, d: number) => void;
+  readonly __wbindgen_export: (a: number) => void;
+  readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
+  readonly __wbindgen_export3: (a: number, b: number) => number;
+  readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
   readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
   readonly __wbindgen_start: () => void;
 }

@@ -166,6 +166,18 @@ impl From<RtcOffset> for RtcOffsetJs {
     }
 }
 
+/// Statistics tracking for geometry parsing
+#[derive(Default)]
+struct GeometryStats {
+    total: u32,
+    success: u32,
+    decode_failed: u32,
+    no_representation: u32,
+    process_failed: u32,
+    empty_mesh: u32,
+    outlier_filtered: u32,
+}
+
 /// Mesh collection with RTC offset for large coordinates
 #[wasm_bindgen]
 pub struct MeshCollectionWithRtc {
@@ -343,14 +355,14 @@ impl IfcAPI {
         let mut meshes: Vec<Mesh> = Vec::with_capacity(2000);
 
         // Process all building elements
-        while let Some((_id, type_name, start, end)) = scanner.next_entity() {
+        while let Some((id, type_name, start, end)) = scanner.next_entity() {
             // Check if this is a building element type
             if !ifc_lite_core::has_geometry_by_name(type_name) {
                 continue;
             }
 
             // Decode and process the entity
-            if let Ok(entity) = decoder.decode_at(start, end) {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                 if let Ok(mesh) = router.process_element(&entity, &mut decoder) {
                     if !mesh.is_empty() {
                         meshes.push(mesh);
@@ -411,7 +423,7 @@ impl IfcAPI {
                 faceted_brep_ids.push(id);
             } else if type_name == "IFCRELVOIDSELEMENT" {
                 // IfcRelVoidsElement: Attr 4 = RelatingBuildingElement, Attr 5 = RelatedOpeningElement
-                if let Ok(entity) = decoder.decode_at(start, end) {
+                if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                     if let (Some(host_id), Some(opening_id)) =
                         (entity.get_ref(4), entity.get_ref(5))
                     {
@@ -421,8 +433,20 @@ impl IfcAPI {
             }
         }
 
-        // Create geometry router (reuses processor instances)
-        let router = GeometryRouter::with_units(&content, &mut decoder);
+        // Create geometry router (without RTC offset initially)
+        let mut router = GeometryRouter::with_units(&content, &mut decoder);
+
+        // DETECT RTC OFFSET from actual building element transforms
+        // This is more reliable than scanning cartesian points because it uses
+        // the actual transform chain (which accumulates to world coordinates)
+        let rtc_offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+        let needs_shift = rtc_offset.0.abs() > 10000.0
+            || rtc_offset.1.abs() > 10000.0
+            || rtc_offset.2.abs() > 10000.0;
+
+        if needs_shift {
+            router.set_rtc_offset(rtc_offset);
+        }
 
         // Batch preprocess FacetedBrep entities for maximum parallelism
         // This triangulates ALL faces from ALL BREPs in one parallel batch
@@ -437,6 +461,14 @@ impl IfcAPI {
         let estimated_elements = content.len() / 500;
         let mut mesh_collection = MeshCollection::with_capacity(estimated_elements);
 
+        // Store RTC offset in collection for JavaScript to use (for camera/world coordinate display)
+        if needs_shift {
+            mesh_collection.set_rtc_offset(rtc_offset.0, rtc_offset.1, rtc_offset.2);
+        }
+
+        // Track geometry parsing statistics
+        let mut stats = GeometryStats::default();
+
         // Process all building elements
         while let Some((id, type_name, start, end)) = scanner.next_entity() {
             // Check if this is a building element type
@@ -444,92 +476,112 @@ impl IfcAPI {
                 continue;
             }
 
+            stats.total += 1;
+
             // Decode and process the entity
-            if let Ok(entity) = decoder.decode_at(start, end) {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                 // Check if entity actually has representation (attribute index 6 for IfcProduct)
                 let has_representation = entity.get(6).map(|a| !a.is_null()).unwrap_or(false);
                 if !has_representation {
+                    stats.no_representation += 1;
                     continue;
                 }
 
-                let ifc_type_name = entity.ifc_type.name().to_string();
-                let default_color = get_default_color_for_type(&entity.ifc_type);
+                // Use process_element_with_voids for ALL elements (simplified from separate paths)
+                // This ensures RTC offset is consistently applied via transform_mesh
+                if let Ok(mut mesh) =
+                    router.process_element_with_voids(&entity, &mut decoder, &void_index)
+                {
+                    if !mesh.is_empty() {
+                        // Calculate normals if not present
+                        if mesh.normals.is_empty() {
+                            calculate_normals(&mut mesh);
+                        }
 
-                // Check if this element has openings that need to be cut
-                let has_voids = void_index.contains_key(&id);
+                        // Try to get color from style index, otherwise use default
+                        let color = style_index
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(|| get_default_color_for_type(&entity.ifc_type));
 
-                if has_voids {
-                    // Element has openings - use combined mesh approach for CSG
-                    if let Ok(mut mesh) =
-                        router.process_element_with_voids(&entity, &mut decoder, &void_index)
-                    {
-                        if !mesh.is_empty() {
-                            if mesh.normals.is_empty() {
-                                calculate_normals(&mut mesh);
+                        // Safety filter: exclude meshes with unreasonable coordinates after RTC
+                        const MAX_REASONABLE_OFFSET: f32 = 50_000.0; // 50km from RTC center
+                        let mut max_coord = 0.0f32;
+                        let mut outlier_vertex_count = 0;
+                        let mut has_non_finite = false;
+
+                        for chunk in mesh.positions.chunks_exact(3) {
+                            let x = chunk[0];
+                            let y = chunk[1];
+                            let z = chunk[2];
+
+                            // Check for NaN/inf coordinates - treat as outliers
+                            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                                outlier_vertex_count += 1;
+                                has_non_finite = true;
+                                continue; // Don't update max_coord with non-finite values
                             }
 
-                            let color = style_index
-                                .get(&id)
-                                .copied()
-                                .unwrap_or(default_color);
-
-                            let mesh_data = MeshDataJs::new(id, ifc_type_name.clone(), mesh, color);
-                            mesh_collection.add(mesh_data);
+                            let coord_mag = x.abs().max(y.abs()).max(z.abs());
+                            max_coord = max_coord.max(coord_mag);
+                            if coord_mag > MAX_REASONABLE_OFFSET {
+                                outlier_vertex_count += 1;
+                            }
                         }
+
+                        // Warn about non-finite coordinates
+                        if has_non_finite {
+                            web_sys::console::warn_1(&format!(
+                                "[WASM FILTER] Mesh #{} ({}) contains NaN/Inf coordinates",
+                                id, entity.ifc_type.name()
+                            ).into());
+                        }
+
+                        // Skip meshes where >90% of vertices are outliers (likely corrupted)
+                        let total_vertices = mesh.positions.len() / 3;
+                        let outlier_ratio = if total_vertices > 0 {
+                            outlier_vertex_count as f32 / total_vertices as f32
+                        } else {
+                            0.0
+                        };
+
+                        // Only filter if >90% outliers OR if max coord is extremely large (>200km)
+                        if outlier_ratio > 0.9 || max_coord > MAX_REASONABLE_OFFSET * 4.0 {
+                            web_sys::console::warn_1(&format!(
+                                "[WASM FILTER] Excluding mesh #{} ({}) - {:.1}% outliers, max coord: {:.2}m",
+                                id, entity.ifc_type.name(), outlier_ratio * 100.0, max_coord
+                            ).into());
+                            stats.outlier_filtered += 1;
+                            continue; // Skip this mesh
+                        }
+
+                        // Create mesh data with express ID, IFC type, and color
+                        let ifc_type_name = entity.ifc_type.name().to_string();
+                        let mesh_data = MeshDataJs::new(id, ifc_type_name, mesh, color);
+                        mesh_collection.add(mesh_data);
+                        stats.success += 1;
+                    } else {
+                        stats.empty_mesh += 1;
                     }
                 } else {
-                    // No openings - try sub-mesh approach for per-item colors
-                    let sub_meshes_result =
-                        router.process_element_with_submeshes(&entity, &mut decoder);
-                    let has_submeshes = sub_meshes_result
-                        .as_ref()
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-
-                    if has_submeshes {
-                        // Use sub-meshes for multi-material elements (windows, doors, etc.)
-                        let sub_meshes = sub_meshes_result.unwrap();
-                        for sub in sub_meshes.sub_meshes {
-                            let mut mesh = sub.mesh;
-                            if mesh.is_empty() {
-                                continue;
-                            }
-                            if mesh.normals.is_empty() {
-                                calculate_normals(&mut mesh);
-                            }
-
-                            // Look up color by geometry item ID (resolving MappedItem chains),
-                            // then by element ID, then default
-                            let color = find_color_for_geometry(sub.geometry_id, &geometry_styles, &mut decoder)
-                                .or_else(|| style_index.get(&id).copied())
-                                .unwrap_or(default_color);
-
-                            let mesh_data =
-                                MeshDataJs::new(id, ifc_type_name.clone(), mesh, color);
-                            mesh_collection.add(mesh_data);
-                        }
-                    } else {
-                        // Fallback: Use standard processing when submesh approach fails
-                        if let Ok(mut mesh) =
-                            router.process_element_with_voids(&entity, &mut decoder, &void_index)
-                        {
-                            if !mesh.is_empty() {
-                                if mesh.normals.is_empty() {
-                                    calculate_normals(&mut mesh);
-                                }
-
-                                let color = style_index
-                                    .get(&id)
-                                    .copied()
-                                    .unwrap_or(default_color);
-
-                                let mesh_data =
-                                    MeshDataJs::new(id, ifc_type_name.clone(), mesh, color);
-                                mesh_collection.add(mesh_data);
-                            }
-                        }
-                    }
+                    stats.process_failed += 1;
                 }
+            } else {
+                stats.decode_failed += 1;
+            }
+        }
+
+        // Emit warning if significant failures occurred
+        if stats.total > 0 {
+            let success_rate = stats.success as f64 / stats.total as f64;
+            if success_rate < 0.5 {
+                web_sys::console::warn_1(&format!(
+                    "[IFC-LITE] Low geometry success rate: {:.1}% ({}/{} elements). \
+                     Decode failed: {}, No representation: {}, Process failed: {}, Empty: {}, Filtered: {}",
+                    success_rate * 100.0, stats.success, stats.total,
+                    stats.decode_failed, stats.no_representation, stats.process_failed,
+                    stats.empty_mesh, stats.outlier_filtered
+                ).into());
             }
         }
 
@@ -607,7 +659,7 @@ impl IfcAPI {
             }
 
             // Decode and process the entity
-            if let Ok(entity) = decoder.decode_at(start, end) {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                 if let Ok((mut mesh, transform)) =
                     router.process_element_with_transform(&entity, &mut decoder)
                 {
@@ -795,7 +847,7 @@ impl IfcAPI {
                             | "IFCRAMP"
                             | "IFCRAMPFLIGHT"
                     ) {
-                        if let Ok(entity) = decoder.decode_at(start, end) {
+                        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                             if let Ok((mut mesh, transform)) =
                                 router.process_element_with_transform(&entity, &mut decoder)
                             {
@@ -951,7 +1003,7 @@ impl IfcAPI {
                 // Process deferred complex geometry
                 let total_elements = processed + deferred_complex.len();
                 for (id, start, end, ifc_type) in deferred_complex {
-                    if let Ok(entity) = decoder.decode_at(start, end) {
+                    if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                         if let Ok((mut mesh, transform)) =
                             router.process_element_with_transform(&entity, &mut decoder)
                         {
@@ -1115,13 +1167,25 @@ impl IfcAPI {
     /// Parse IFC file with streaming mesh batches for progressive rendering
     /// Calls the callback with batches of meshes, yielding to browser between batches
     ///
+    /// Options:
+    /// - `batchSize`: Number of meshes per batch (default: 25)
+    /// - `onBatch(meshes, progress)`: Called for each batch of meshes
+    /// - `onRtcOffset({x, y, z, hasRtc})`: Called early with RTC offset for camera/world setup
+    /// - `onColorUpdate(Map<id, color>)`: Called with style updates after initial render
+    /// - `onComplete(stats)`: Called when parsing completes with stats including rtcOffset
+    ///
     /// Example:
     /// ```javascript
     /// const api = new IfcAPI();
     /// await api.parseMeshesAsync(ifcData, {
     ///   batchSize: 100,
+    ///   onRtcOffset: (rtc) => {
+    ///     if (rtc.hasRtc) {
+    ///       // Model uses large coordinates - adjust camera/world origin
+    ///       viewer.setWorldOffset(rtc.x, rtc.y, rtc.z);
+    ///     }
+    ///   },
     ///   onBatch: (meshes, progress) => {
-    ///     // Add meshes to scene
     ///     for (const mesh of meshes) {
     ///       scene.add(createThreeMesh(mesh));
     ///     }
@@ -1129,6 +1193,7 @@ impl IfcAPI {
     ///   },
     ///   onComplete: (stats) => {
     ///     console.log(`Done! ${stats.totalMeshes} meshes`);
+    ///     // stats.rtcOffset also available here: {x, y, z, hasRtc}
     ///   }
     /// });
     /// ```
@@ -1161,6 +1226,10 @@ impl IfcAPI {
                     .ok()
                     .and_then(|v| v.dyn_into::<Function>().ok());
 
+                let on_rtc_offset = js_sys::Reflect::get(&options, &"onRtcOffset".into())
+                    .ok()
+                    .and_then(|v| v.dyn_into::<Function>().ok());
+
                 // Build entity index for lookups
                 let entity_index = ifc_lite_core::build_entity_index(&content);
                 let mut decoder = EntityDecoder::with_index(&content, entity_index.clone());
@@ -1172,7 +1241,27 @@ impl IfcAPI {
                     rustc_hash::FxHashMap::default();
 
                 // Create geometry router
-                let router = GeometryRouter::with_units(&content, &mut decoder);
+                let mut router = GeometryRouter::with_units(&content, &mut decoder);
+
+                // DETECT RTC OFFSET from actual building element transforms (same as sync version)
+                let rtc_offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+                let needs_shift = rtc_offset.0.abs() > 10000.0
+                    || rtc_offset.1.abs() > 10000.0
+                    || rtc_offset.2.abs() > 10000.0;
+
+                if needs_shift {
+                    router.set_rtc_offset(rtc_offset);
+                }
+
+                // Surface RTC offset to JavaScript callers early so they can prepare camera/world state
+                if let Some(ref callback) = on_rtc_offset {
+                    let rtc_info = js_sys::Object::new();
+                    set_js_prop(&rtc_info, "x", &rtc_offset.0.into());
+                    set_js_prop(&rtc_info, "y", &rtc_offset.1.into());
+                    set_js_prop(&rtc_info, "z", &rtc_offset.2.into());
+                    set_js_prop(&rtc_info, "hasRtc", &needs_shift.into());
+                    let _ = callback.call1(&JsValue::NULL, &rtc_info);
+                }
 
                 // Process counters
                 let mut processed = 0;
@@ -1194,7 +1283,7 @@ impl IfcAPI {
                         faceted_brep_ids.push(id);
                     } else if type_name == "IFCRELVOIDSELEMENT" {
                         // IfcRelVoidsElement: Attr 4 = RelatingBuildingElement, Attr 5 = RelatedOpeningElement
-                        if let Ok(entity) = decoder.decode_at(start, end) {
+                        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                             if let (Some(host_id), Some(opening_id)) =
                                 (entity.get_ref(4), entity.get_ref(5))
                             {
@@ -1235,7 +1324,7 @@ impl IfcAPI {
                             | "IFCRAMP"
                             | "IFCRAMPFLIGHT"
                     ) {
-                        if let Ok(entity) = decoder.decode_at(start, end) {
+                        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                             // Check if entity actually has representation
                             let has_representation =
                                 entity.get(6).map(|a| !a.is_null()).unwrap_or(false);
@@ -1251,7 +1340,6 @@ impl IfcAPI {
                                             calculate_normals(&mut mesh);
                                         }
 
-                                        // FIX: Use styled colors from IFC file, fallback to default
                                         let color = style_index
                                             .get(&id)
                                             .copied()
@@ -1263,7 +1351,7 @@ impl IfcAPI {
                                         let mesh_data =
                                             MeshDataJs::new(id, ifc_type_name, mesh, color);
                                         batch_meshes.push(mesh_data);
-                                        processed_simple_ids.push(id); // Track for color updates
+                                        processed_simple_ids.push(id);
                                         processed += 1;
                                     }
                                 }
@@ -1349,7 +1437,7 @@ impl IfcAPI {
                 // Process deferred complex geometry with proper styles and void subtraction
 
                 for (id, start, end, ifc_type) in deferred_complex {
-                    if let Ok(entity) = decoder.decode_at(start, end) {
+                    if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                         let has_openings = void_index.contains_key(&id);
                         let ifc_type_name = ifc_type.name().to_string();
                         let default_color = get_default_color_for_type(&ifc_type);
@@ -1495,6 +1583,13 @@ impl IfcAPI {
                     set_js_prop(&stats, "totalMeshes", &(total_meshes as f64).into());
                     set_js_prop(&stats, "totalVertices", &(total_vertices as f64).into());
                     set_js_prop(&stats, "totalTriangles", &(total_triangles as f64).into());
+                    // Include RTC offset info in completion stats
+                    let rtc_info = js_sys::Object::new();
+                    set_js_prop(&rtc_info, "x", &rtc_offset.0.into());
+                    set_js_prop(&rtc_info, "y", &rtc_offset.1.into());
+                    set_js_prop(&rtc_info, "z", &rtc_offset.2.into());
+                    set_js_prop(&rtc_info, "hasRtc", &needs_shift.into());
+                    set_js_prop(&stats, "rtcOffset", &rtc_info);
                     let _ = callback.call1(&JsValue::NULL, &stats);
                 }
 
@@ -1695,7 +1790,7 @@ impl IfcAPI {
                 continue;
             }
 
-            if let Ok(entity) = decoder.decode_at(start, end) {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                 // Check if entity actually has representation (attribute index 6 for IfcProduct)
                 let has_representation = entity.get(6).map(|a| !a.is_null()).unwrap_or(false);
                 if !has_representation {
@@ -1795,7 +1890,7 @@ impl IfcAPI {
             if type_name == "IFCFACETEDBREP" {
                 faceted_brep_ids.push(id);
             } else if type_name == "IFCRELVOIDSELEMENT" {
-                if let Ok(entity) = decoder.decode_at(start, end) {
+                if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                     if let (Some(host_id), Some(opening_id)) =
                         (entity.get_ref(4), entity.get_ref(5))
                     {
@@ -1805,8 +1900,18 @@ impl IfcAPI {
             }
         }
 
-        // Create geometry router
-        let router = GeometryRouter::with_units(&content, &mut decoder);
+        // Create geometry router (without RTC offset initially)
+        let mut router = GeometryRouter::with_units(&content, &mut decoder);
+
+        // DETECT RTC OFFSET from actual building element transforms
+        let rtc_offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+        let needs_shift = rtc_offset.0.abs() > 10000.0
+            || rtc_offset.1.abs() > 10000.0
+            || rtc_offset.2.abs() > 10000.0;
+
+        if needs_shift {
+            router.set_rtc_offset(rtc_offset);
+        }
 
         // Batch preprocess FacetedBreps
         if !faceted_brep_ids.is_empty() {
@@ -1827,7 +1932,7 @@ impl IfcAPI {
                 continue;
             }
 
-            if let Ok(entity) = decoder.decode_at(start, end) {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                 // Check if entity has representation
                 let has_representation = entity.get(6).map(|a| !a.is_null()).unwrap_or(false);
                 if !has_representation {
@@ -1861,6 +1966,11 @@ impl IfcAPI {
                     }
                 }
             }
+        }
+
+        // Set RTC offset on the GPU geometry so callers can apply it
+        if needs_shift {
+            gpu_geometry.set_rtc_offset(rtc_offset.0, rtc_offset.1, rtc_offset.2);
         }
 
         gpu_geometry
@@ -1941,7 +2051,7 @@ impl IfcAPI {
                     if type_name == "IFCFACETEDBREP" {
                         faceted_brep_ids.push(id);
                     } else if type_name == "IFCRELVOIDSELEMENT" {
-                        if let Ok(entity) = decoder.decode_at(start, end) {
+                        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                             if let (Some(host_id), Some(opening_id)) =
                                 (entity.get_ref(4), entity.get_ref(5))
                             {
@@ -1952,7 +2062,17 @@ impl IfcAPI {
                 }
 
                 // Create geometry router
-                let router = GeometryRouter::with_units(&content, &mut decoder);
+                let mut router = GeometryRouter::with_units(&content, &mut decoder);
+
+                // DETECT RTC OFFSET from actual building element transforms
+                let rtc_offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+                let needs_shift = rtc_offset.0.abs() > 10000.0
+                    || rtc_offset.1.abs() > 10000.0
+                    || rtc_offset.2.abs() > 10000.0;
+
+                if needs_shift {
+                    router.set_rtc_offset(rtc_offset);
+                }
 
                 // Batch preprocess FacetedBreps
                 if !faceted_brep_ids.is_empty() {
@@ -1971,7 +2091,7 @@ impl IfcAPI {
                 let mut deferred_complex: Vec<(u32, usize, usize, ifc_lite_core::IfcType)> =
                     Vec::new();
 
-                // Helper to flush current batch
+                // Helper to flush current batch (captures RTC offset for each batch)
                 let flush_batch = |batch: &mut GpuGeometry,
                                    on_batch: &Option<Function>,
                                    progress: &JsValue| {
@@ -1980,9 +2100,12 @@ impl IfcAPI {
                     }
 
                     if let Some(ref callback) = on_batch {
-                        // Swap out the batch
-                        let to_send =
+                        // Swap out the batch and set RTC offset before sending
+                        let mut to_send =
                             std::mem::replace(batch, GpuGeometry::with_capacity(1000, 3000));
+                        if needs_shift {
+                            to_send.set_rtc_offset(rtc_offset.0, rtc_offset.1, rtc_offset.2);
+                        }
                         let _ = callback.call2(&JsValue::NULL, &to_send.into(), progress);
                     } else {
                         batch.clear();
@@ -2015,7 +2138,7 @@ impl IfcAPI {
                             | "IFCRAMP"
                             | "IFCRAMPFLIGHT"
                     ) {
-                        if let Ok(entity) = decoder.decode_at(start, end) {
+                        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                             let has_representation =
                                 entity.get(6).map(|a| !a.is_null()).unwrap_or(false);
                             if has_representation {
@@ -2081,7 +2204,7 @@ impl IfcAPI {
                 // Process deferred complex geometry
                 let total_elements = processed + deferred_complex.len();
                 for (id, start, end, ifc_type) in deferred_complex {
-                    if let Ok(entity) = decoder.decode_at(start, end) {
+                    if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                         if let Ok(mut mesh) =
                             router.process_element_with_voids(&entity, &mut decoder, &void_index)
                         {
@@ -2141,6 +2264,16 @@ impl IfcAPI {
                     set_js_prop(&stats, "totalMeshes", &(total_meshes as f64).into());
                     set_js_prop(&stats, "totalVertices", &(total_vertices as f64).into());
                     set_js_prop(&stats, "totalTriangles", &(total_triangles as f64).into());
+
+                    // Include RTC offset if applied
+                    if needs_shift {
+                        let rtc_obj = js_sys::Object::new();
+                        set_js_prop(&rtc_obj, "x", &rtc_offset.0.into());
+                        set_js_prop(&rtc_obj, "y", &rtc_offset.1.into());
+                        set_js_prop(&rtc_obj, "z", &rtc_offset.2.into());
+                        set_js_prop(&stats, "rtcOffset", &rtc_obj);
+                    }
+
                     let _ = callback.call1(&JsValue::NULL, &stats);
                 }
 
@@ -2203,7 +2336,7 @@ impl IfcAPI {
                 continue;
             }
 
-            if let Ok(entity) = decoder.decode_at(start, end) {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
                 if let Ok((mut mesh, transform)) =
                     router.process_element_with_transform(&entity, &mut decoder)
                 {
@@ -2291,7 +2424,7 @@ impl IfcAPI {
         // Find entity 953
         while let Some((id, _type_name, start, end)) = scanner.next_entity() {
             if id == 953 {
-                match decoder.decode_at(start, end) {
+                match decoder.decode_at_with_id(id, start, end) {
                     Ok(entity) => match router.process_element(&entity, &mut decoder) {
                         Ok(mesh) => {
                             return format!(
@@ -2330,7 +2463,7 @@ impl IfcAPI {
                 let ifc_type = ifc_lite_core::IfcType::from_str(type_name);
                 if router.schema().has_geometry(&ifc_type) {
                     // Try to decode and process
-                    match decoder.decode_at(start, end) {
+                    match decoder.decode_at_with_id(id, start, end) {
                         Ok(entity) => match router.process_element(&entity, &mut decoder) {
                             Ok(mesh) => {
                                 return format!(
@@ -2445,13 +2578,13 @@ fn build_geometry_style_index(
     let mut scanner = EntityScanner::new(content);
 
     // First pass: find all IfcStyledItem entities
-    while let Some((_id, type_name, start, end)) = scanner.next_entity() {
+    while let Some((id, type_name, start, end)) = scanner.next_entity() {
         if type_name != "IFCSTYLEDITEM" {
             continue;
         }
 
         // Decode the IfcStyledItem
-        let styled_item = match decoder.decode_at(start, end) {
+        let styled_item = match decoder.decode_at_with_id(id, start, end) {
             Ok(entity) => entity,
             Err(_) => continue,
         };
@@ -2504,7 +2637,7 @@ fn build_element_style_index(
         }
 
         // Decode the element
-        let element = match decoder.decode_at(start, end) {
+        let element = match decoder.decode_at_with_id(element_id, start, end) {
             Ok(entity) => entity,
             Err(_) => continue,
         };

@@ -25,6 +25,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["console_error_panic_hook"]
+debug_geometry = ["ifc-lite-geometry/debug_geometry"]
 
 [dependencies]
 console_error_panic_hook = { version = "0.1", optional = true }
