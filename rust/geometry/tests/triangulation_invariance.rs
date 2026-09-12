@@ -229,6 +229,15 @@ fn set_alt(on: bool) {
 #[cfg(not(feature = "triangulation-alt"))]
 fn set_alt(_on: bool) {}
 
+/// Restore the process-wide triangulator switch even when an assertion panics.
+struct AltTriangulatorReset;
+
+impl Drop for AltTriangulatorReset {
+    fn drop(&mut self) {
+        set_alt(false);
+    }
+}
+
 fn void_index(content: &str) -> FxHashMap<u32, Vec<u32>> {
     let mut idx: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut scanner = EntityScanner::new(content);
@@ -1402,6 +1411,44 @@ fn watertightness_census_and_triangulator_invariance() {
         run.non_invariant,
         expected.non_invariant
     );
+}
+
+/// Regression for #4610: applying correct footprint-union semantics to this
+/// mixed slab changed the residual cutter's input and tore it from 25 to 875
+/// open edges. Until #4617 repairs that composition, the mixed-only parity route
+/// must preserve the established topology under both triangulators. The same
+/// contract holds with the optional prism route disabled; that mode has its own
+/// expected tessellation and runs in a separate process during validation.
+#[test]
+fn issue_129_mixed_bool2d_residual_preserves_established_topology() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset = AltTriangulatorReset;
+    let rel = "ara3d/ISSUE_129_N1540_17_EXE_MOD_448200_02_09_11SMC_IGC_V17.ifc".to_string();
+    let path = crate_dir().join("../..").join("tests/models").join(&rel);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        eprintln!("SKIPPED: fixture absent; run `pnpm fixtures` to install {}", path.display());
+        return;
+    };
+    let voids = void_index(&content);
+    let frame = ModelFrame::new(&content);
+    for alt in [false, true] {
+        set_alt(alt);
+        let expected = if std::env::var("IFC_LITE_PRISM_CUT").as_deref() == Ok("0") {
+            [(12381, 30, 31, 9400), (32810, 0, 0, 1936)]
+        } else {
+            [(12381, 25, 26, 7565), (32810, 3, 3, 2005)]
+        };
+        for (id, open, strict, tris) in expected {
+            let mesh =
+                process(&frame, id, &voids).unwrap_or_else(|| panic!("host #{id} must mesh"));
+            let stats = edge_stats(&mesh);
+            assert_eq!(stats.open, open, "host #{id}, alt={alt}: signed edge reading");
+            assert_eq!(stats.strict, strict, "host #{id}, alt={alt}: strict edge reading");
+            if !alt {
+                assert_eq!(mesh.triangle_count(), tris, "host #{id}: geometry must not shrink");
+            }
+        }
+    }
 }
 
 /// A unit cube as 8 welded vertices and 12 consistently wound triangles.
