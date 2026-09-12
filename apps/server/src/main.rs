@@ -55,6 +55,7 @@ mod middleware;
 mod panic_strategy;
 mod routes;
 mod services;
+mod write_timeout;
 mod types;
 
 /// Slack added on top of `max_file_size_mb` for the raw framework-level body
@@ -350,6 +351,10 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {addr}"))?;
+    let listener = write_timeout::WriteTimeoutListener::new(
+        listener,
+        Duration::from_secs(config.stream_idle_timeout_secs),
+    );
     axum::serve(listener, app)
         .await
         .context("server exited with an error")?;
